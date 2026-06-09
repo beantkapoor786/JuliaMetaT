@@ -20,14 +20,33 @@ Returns two parallel host arrays:
 - contig_of_kmer: Vector{Int32} same length, giving the contig index
   each k-mer belongs to.
 """
+@inline function _char_to_2bit(c::Char)::UInt64
+    c == 'A' || c == 'a' ? UInt64(0) :
+    c == 'C' || c == 'c' ? UInt64(1) :
+    c == 'G' || c == 'g' ? UInt64(2) :
+                           UInt64(3)
+end
+
 function build_contig_kmer_index(contigs::AbstractVector{Contig}, k::Int)
+    k32 = Int32(k)
+    mask = (UInt64(1) << (UInt64(2) * UInt64(k))) - UInt64(1)
     pairs = Tuple{UInt64,Int32}[]
     for (ci, c) in enumerate(contigs)
         s = c.sequence
-        length(s) >= k || continue
-        for i in 1:(length(s) - k + 1)
-            km = string_to_canonical_kmer(s[i:i+k-1], k)
-            push!(pairs, (km, Int32(ci)))
+        n = length(s)
+        n >= k || continue
+        # Build first k-mer
+        kmer = UInt64(0)
+        @inbounds for i in 1:k
+            kmer = (kmer << 2) | _char_to_2bit(s[i])
+        end
+        rc = _revcomp(kmer, k32)
+        push!(pairs, (kmer < rc ? kmer : rc, Int32(ci)))
+        # Roll subsequent k-mers: drop leftmost base, shift in new base
+        @inbounds for i in (k+1):n
+            kmer = ((kmer << 2) | _char_to_2bit(s[i])) & mask
+            rc = _revcomp(kmer, k32)
+            push!(pairs, (kmer < rc ? kmer : rc, Int32(ci)))
         end
     end
     # Sort by k-mer; dedup by keeping the first contig assignment for
@@ -60,11 +79,6 @@ end
 # tallies hits per contig. Then it picks the contig with the most hits
 # (majority vote). Output: out_assignment[j] = contig index (0 = unmapped).
 #
-# We use a per-thread small array of counts up to n_contigs. To avoid
-# allocating large per-thread buffers, we cap n_contigs at COUNT_CAP and
-# linear-scan for the max. For an MVP with ~3-30 contigs this is fine.
-
-const COUNT_CAP = Int32(64)   # max contigs supported by this kernel
 
 function _map_kernel!(j, seqs, lengths, sorted_kmers, contig_of_kmer,
                      out_assignment, out_hits,
@@ -88,58 +102,61 @@ function _map_kernel!(j, seqs, lengths, sorted_kmers, contig_of_kmer,
     return nothing
 end
 
-# Real kernel (with pre-allocated per-thread counts buffer):
-function _map_kernel_v2!(j, seqs, lengths, sorted_kmers, contig_of_kmer,
-                          counts_buf, out_assignment, out_hits,
-                          n_kmers_in_index::Int32,
-                          k::Int32, n_contigs::Int32, min_hits::Int32)
+# SWAR 5-step 2-bit-group reversal: reverses order of k 2-bit groups in low 2k bits.
+@inline function _revcomp_swar(kmer::UInt64, k::Int32)::UInt64
+    mask = (UInt64(1) << (UInt64(2) * UInt64(k))) - UInt64(1)
+    x = (~kmer) & mask
+    # Reverse order of 2-bit groups via 5-step word-level shuffle.
+    x = ((x & UInt64(0x3333333333333333)) << 2)  | ((x >> 2)  & UInt64(0x3333333333333333))
+    x = ((x & UInt64(0x0F0F0F0F0F0F0F0F)) << 4)  | ((x >> 4)  & UInt64(0x0F0F0F0F0F0F0F0F))
+    x = ((x & UInt64(0x00FF00FF00FF00FF)) << 8)  | ((x >> 8)  & UInt64(0x00FF00FF00FF00FF))
+    x = ((x & UInt64(0x0000FFFF0000FFFF)) << 16) | ((x >> 16) & UInt64(0x0000FFFF0000FFFF))
+    x = (x << 32) | (x >> 32)
+    x >> (UInt64(64) - UInt64(2) * UInt64(k))
+end
+
+# Streaming majority-vote kernel with rolling hash and SWAR revcomp.
+# Pass 1: Boyer-Moore majority candidate via O(L) rolling scan.
+# Pass 2: verify candidate hit count >= min_hits.
+function _map_kernel_streaming!(j, seqs, lengths, sorted_kmers, contig_of_kmer,
+                                out_assignment, out_hits,
+                                n_kmers_in_index::Int32,
+                                k::Int32, min_hits::Int32)
     L = lengths[j]
-
-    # Zero the count column for thread j.
-    @inbounds for c in Int32(1):n_contigs
-        counts_buf[c, j] = Int32(0)
-    end
-
     if L < k
         out_assignment[j] = Int32(0)
         out_hits[j]       = Int32(0)
         return nothing
     end
 
-    # Compute and look up each k-mer in this read.
-    @inbounds for p in Int32(1):(L - k + Int32(1))
-        # Build packed k-mer + its rev-comp; take canonical.
-        kmer = UInt64(0)
-        valid = true
-        for i in Int32(0):(k - Int32(1))
-            b = seqs[p + i, j]
-            # remap A=1,C=4,G=3,T=2 -> 0..3
-            bb = b == Int8(1) ? UInt64(0) :
-                 b == Int8(4) ? UInt64(1) :
-                 b == Int8(3) ? UInt64(2) :
-                 b == Int8(2) ? UInt64(3) :
-                                UInt64(99)   # N or padding
-            if bb == UInt64(99)
-                valid = false
-                break
-            end
-            kmer = (kmer << 2) | bb
-        end
-        valid || continue
+    mask = (UInt64(1) << (UInt64(2) * UInt64(k))) - UInt64(1)
 
-        # Canonicalize.
-        mask = (UInt64(1) << (UInt64(2) * UInt64(k))) - UInt64(1)
-        x = (~kmer) & mask
-        rc = UInt64(0)
-        for i in Int32(0):(k - Int32(1))
-            pair = (x >> (UInt64(2) * UInt64(i))) & UInt64(0x3)
-            rc |= pair << (UInt64(2) * UInt64(k - Int32(1) - i))
+    # --- Pass 1: Boyer-Moore majority candidate (rolling hash) ---
+    candidate = Int32(0)
+    counter   = Int32(0)
+    kmer      = UInt64(0)
+    run       = Int32(0)
+
+    @inbounds for pos in Int32(1):L
+        b  = seqs[pos, j]
+        bb = b == Int8(1) ? UInt64(0) :
+             b == Int8(4) ? UInt64(1) :
+             b == Int8(3) ? UInt64(2) :
+             b == Int8(2) ? UInt64(3) :
+                            UInt64(99)
+        if bb == UInt64(99)
+            run  = Int32(0)
+            kmer = UInt64(0)
+            continue
         end
+        kmer = ((kmer << 2) | bb) & mask
+        run += Int32(1)
+        run < k && continue
+
+        rc    = _revcomp_swar(kmer, k)
         canon = kmer < rc ? kmer : rc
 
-        # Binary search in sorted_kmers.
-        lo = Int32(1)
-        hi = n_kmers_in_index
+        lo = Int32(1); hi = n_kmers_in_index
         found_at = Int32(0)
         while lo <= hi
             mid = (lo + hi) >> 1
@@ -152,35 +169,77 @@ function _map_kernel_v2!(j, seqs, lengths, sorted_kmers, contig_of_kmer,
                 hi = mid - Int32(1)
             end
         end
-        if found_at > 0
-            ci = contig_of_kmer[found_at]
-            counts_buf[ci, j] += Int32(1)
+        found_at == Int32(0) && continue
+
+        ci = contig_of_kmer[found_at]
+        if counter == Int32(0)
+            candidate = ci
+            counter   = Int32(1)
+        elseif candidate == ci
+            counter += Int32(1)
+        else
+            counter -= Int32(1)
         end
     end
 
-    # Majority vote.
-    best_c = Int32(0)
-    best_n = Int32(0)
-    @inbounds for c in Int32(1):n_contigs
-        v = counts_buf[c, j]
-        if v > best_n
-            best_n = v
-            best_c = c
-        end
+    if candidate == Int32(0)
+        out_assignment[j] = Int32(0)
+        out_hits[j]       = Int32(0)
+        return nothing
     end
 
-    out_assignment[j] = best_n >= min_hits ? best_c : Int32(0)
-    out_hits[j]       = best_n
+    # --- Pass 2: verify candidate hit count (rolling hash) ---
+    hits = Int32(0)
+    kmer = UInt64(0)
+    run  = Int32(0)
+
+    @inbounds for pos in Int32(1):L
+        b  = seqs[pos, j]
+        bb = b == Int8(1) ? UInt64(0) :
+             b == Int8(4) ? UInt64(1) :
+             b == Int8(3) ? UInt64(2) :
+             b == Int8(2) ? UInt64(3) :
+                            UInt64(99)
+        if bb == UInt64(99)
+            run  = Int32(0)
+            kmer = UInt64(0)
+            continue
+        end
+        kmer = ((kmer << 2) | bb) & mask
+        run += Int32(1)
+        run < k && continue
+
+        rc    = _revcomp_swar(kmer, k)
+        canon = kmer < rc ? kmer : rc
+
+        lo = Int32(1); hi = n_kmers_in_index
+        found_at = Int32(0)
+        while lo <= hi
+            mid = (lo + hi) >> 1
+            v = sorted_kmers[mid]
+            if v == canon
+                found_at = mid; break
+            elseif v < canon
+                lo = mid + Int32(1)
+            else
+                hi = mid - Int32(1)
+            end
+        end
+        found_at == Int32(0) && continue
+
+        contig_of_kmer[found_at] == candidate && (hits += Int32(1))
+    end
+
+    if hits >= min_hits
+        out_assignment[j] = candidate
+        out_hits[j]       = hits
+    else
+        out_assignment[j] = Int32(0)
+        out_hits[j]       = hits
+    end
     return nothing
 end
 
-"""
-    map_reads(contigs, seqs_h, lengths_h; k=31, min_hits=3) -> (assignments, hits)
-
-Map each read to its best-matching contig by canonical k-mer pseudo-
-alignment. Reads with fewer than `min_hits` matches go to contig 0
-(unmapped). Returns host arrays length n_reads.
-"""
 function map_reads(contigs::AbstractVector{Contig},
                    seqs_h::AbstractMatrix{Int8},
                    lengths_h::AbstractVector{<:Integer};
@@ -188,30 +247,24 @@ function map_reads(contigs::AbstractVector{Contig},
                    min_hits::Int = 3)
     n_reads = length(lengths_h)
     n_contigs = length(contigs)
-    @assert n_contigs <= COUNT_CAP "more than $COUNT_CAP contigs not supported in this kernel"
     n_reads == 0 && return (Int32[], Int32[])
     n_contigs == 0 && return (zeros(Int32, n_reads), zeros(Int32, n_reads))
 
     sorted_kmers, contig_of_kmer = build_contig_kmer_index(contigs, k)
     n_idx = length(sorted_kmers)
+    n_idx == 0 && return (zeros(Int32, n_reads), zeros(Int32, n_reads))
 
-    if n_idx == 0
-        return (zeros(Int32, n_reads), zeros(Int32, n_reads))
-    end
+    seqs_d           = JACC.to_device(seqs_h)
+    lengths_d        = JACC.to_device(Int32.(lengths_h))
+    sorted_kmers_d   = JACC.to_device(sorted_kmers)
+    contig_of_kmer_d = JACC.to_device(contig_of_kmer)
+    out_assignment_d = JACC.to_device(zeros(Int32, n_reads))
+    out_hits_d       = JACC.to_device(zeros(Int32, n_reads))
 
-    # Move to device.
-    seqs_d            = JACC.to_device(seqs_h)
-    lengths_d         = JACC.to_device(Int32.(lengths_h))
-    sorted_kmers_d    = JACC.to_device(sorted_kmers)
-    contig_of_kmer_d  = JACC.to_device(contig_of_kmer)
-    counts_buf_d      = JACC.to_device(zeros(Int32, Int(COUNT_CAP), n_reads))
-    out_assignment_d  = JACC.to_device(zeros(Int32, n_reads))
-    out_hits_d        = JACC.to_device(zeros(Int32, n_reads))
-
-    JACC.parallel_for(n_reads, _map_kernel_v2!,
+    JACC.parallel_for(n_reads, _map_kernel_streaming!,
         seqs_d, lengths_d, sorted_kmers_d, contig_of_kmer_d,
-        counts_buf_d, out_assignment_d, out_hits_d,
-        Int32(n_idx), Int32(k), Int32(n_contigs), Int32(min_hits))
+        out_assignment_d, out_hits_d,
+        Int32(n_idx), Int32(k), Int32(min_hits))
 
     return JACC.to_host(out_assignment_d), JACC.to_host(out_hits_d)
 end

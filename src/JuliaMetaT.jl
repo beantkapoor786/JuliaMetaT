@@ -14,14 +14,18 @@ include("traversal.jl")
 include("mapping.jl")
 include("io.jl")
 include("pipeline.jl")
+include("kmc_backend.jl")
 
 # Round 0
 export set_backend, current_backend
-export encode_reads, decode_read, load_fastq
+export encode_reads, decode_read, load_fastq, stream_fastq
 export generate_synthetic_paired_fastq
 
 # Round 1
 export extract_kmers, count_kmers, kmer_to_string, string_to_canonical_kmer
+
+# KMC backend (Round 1, alternative path)
+export count_kmers_kmc, check_kmc
 
 # Round 2
 export DeBruijnGraph, CompactedGraph

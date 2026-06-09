@@ -31,15 +31,14 @@ function run_pipeline(r1_path::AbstractString,
     verbose && println("[load]    n_reads=$n_reads n_dropped=$n_dropped  ($(round(t_load, digits=3))s)")
 
     t_kmer = @elapsed begin
-        flat = extract_kmers(seqs_h, lengths_h; k = k)
-        uniq, cnts = count_kmers(copy(flat); min_count = min_count)
-    end
-    verbose && println("[kmers]   total=$(length(flat)) unique≥$(min_count)=$(length(uniq))  ($(round(t_kmer, digits=3))s)")
-
+        uniq, cnts = count_kmers_kmc(r1_path, r2_path;
+            k = k, min_count = min_count, verbose = verbose)
+end
+verbose && println("[kmers]   unique≥$(min_count)=$(length(uniq))  ($(round(t_kmer, digits=3))s)")
     t_graph = @elapsed begin
         g = build_graph(uniq, cnts; k = k)
-        n_removed = remove_tips!(g; min_edge_weight, relative_threshold)
-        cg = compact_unitigs(g)
+        n_removed = remove_tips!(g; min_edge_weight, relative_threshold, verbose)
+        cg = compact_unitigs(g; verbose)
     end
     verbose && println("[graph]   edges_pruned=$n_removed unitigs=$(n_unitigs(cg))  ($(round(t_graph, digits=3))s)")
 

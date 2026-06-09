@@ -74,9 +74,9 @@ end
 
 # Map a raw (k-1)-mer (in some orientation) to its oriented node ID.
 @inline function _oriented_id(raw_km1mer::UInt64, km1::Int,
-                              node_id_map::Dict{UInt64,Int32})
+                              canonical_kmers::Vector{UInt64})
     canon, is_fwd = _canonicalize_km1(raw_km1mer, km1)
-    cidx = node_id_map[canon]
+    cidx = searchsortedfirst(canonical_kmers, canon)
     return is_fwd ? forward_id(cidx) : reverse_id(cidx)
 end
 
@@ -93,89 +93,96 @@ function build_graph(uniq_kmers::Vector{UInt64},
     @assert length(uniq_kmers) == length(counts)
     km1 = k - 1
 
-    # --- Pass 1: collect canonical (k-1)-mer set. ---
-    node_set = Set{UInt64}()
-    sizehint!(node_set, 2 * length(uniq_kmers))
-    for kmer in uniq_kmers
-        prefix, suffix, _, _ = _split_kmer(kmer, k)
-        push!(node_set, _canonicalize_km1(prefix, km1)[1])
-        push!(node_set, _canonicalize_km1(suffix, km1)[1])
+    # --- Pass 1: collect canonical (k-1)-mer set via sort+dedup. ---
+    # Flat preallocated array + sort is ~3-5x faster than Set{UInt64} at
+    # this scale (46M entries) due to cache-friendly sequential access.
+    n_kmers = length(uniq_kmers)
+    km1mers = Vector{UInt64}(undef, 2 * n_kmers)
+    @inbounds for i in 1:n_kmers
+        prefix, suffix, _, _ = _split_kmer(uniq_kmers[i], k)
+        km1mers[2i-1] = _canonicalize_km1(prefix, km1)[1]
+        km1mers[2i]   = _canonicalize_km1(suffix, km1)[1]
     end
-    canonical_kmers = sort!(collect(node_set))
-    n_canonical = length(canonical_kmers)
-    node_id_map = Dict{UInt64,Int32}(km => Int32(i)
-                                     for (i, km) in enumerate(canonical_kmers))
+    sort!(km1mers)
+    # Manual dedup into canonical_kmers — avoids the extra allocation of unique!
+    canonical_kmers = Vector{UInt64}(undef, 2 * n_kmers)
+    n_canonical = 0
+    @inbounds for i in 1:(2 * n_kmers)
+        if i == 1 || km1mers[i] != km1mers[i-1]
+            n_canonical += 1
+            canonical_kmers[n_canonical] = km1mers[i]
+        end
+    end
+    resize!(canonical_kmers, n_canonical)
 
     # --- Pass 2: build edge list with twin tracking. ---
-    # Each k-mer -> 2 edges. Even-indexed in our temp arrays are forward,
-    # odd-indexed are reverse twins (or vice versa); we'll record the
-    # mapping explicitly so the twin pointer survives sorting.
-    n_edges = 2 * length(uniq_kmers)
-    edge_src   = Vector{Int32}(undef, n_edges)
-    edge_dst   = Vector{Int32}(undef, n_edges)
-    edge_w     = Vector{Int32}(undef, n_edges)
-    edge_lbl   = Vector{UInt8}(undef, n_edges)
-    twin_temp  = Vector{Int32}(undef, n_edges)   # original index of twin
+    # Each k-mer i -> forward edge at 2i-1, reverse twin at 2i.
+    # Index-based layout (no sequential counter) makes this loop
+    # embarrassingly parallel — each iteration writes only to its own pair.
+    n_edges    = 2 * n_kmers
+    n_oriented = 2 * n_canonical
+    edge_src  = Vector{Int32}(undef, n_edges)
+    edge_dst  = Vector{Int32}(undef, n_edges)
+    edge_w    = Vector{Int32}(undef, n_edges)
+    edge_lbl  = Vector{UInt8}(undef, n_edges)
+    twin_temp = Vector{Int32}(undef, n_edges)
 
-    e = 0
-    for (kmer, count) in zip(uniq_kmers, counts)
-        prefix, suffix, first_base, last_base = _split_kmer(kmer, k)
+    Threads.@threads for i in 1:n_kmers
+        i_fwd = 2i - 1
+        i_rev = 2i
+        prefix, suffix, first_base, last_base = _split_kmer(uniq_kmers[i], k)
 
-        # Forward: oriented node of `prefix` -> oriented node of `suffix`
-        src_fwd = _oriented_id(prefix, km1, node_id_map)
-        dst_fwd = _oriented_id(suffix, km1, node_id_map)
-
-        # Reverse twin: oriented node of rc(suffix) -> oriented node of rc(prefix)
-        # Note: _oriented_id of rc(x) = twin of _oriented_id of x.
+        src_fwd = _oriented_id(prefix, km1, canonical_kmers)
+        dst_fwd = _oriented_id(suffix, km1, canonical_kmers)
         src_rev = twin(dst_fwd)
         dst_rev = twin(src_fwd)
 
-        e += 1
-        i_fwd = e
-        edge_src[i_fwd] = src_fwd
-        edge_dst[i_fwd] = dst_fwd
-        edge_w[i_fwd]   = count
-        edge_lbl[i_fwd] = last_base
+        edge_src[i_fwd] = src_fwd;  edge_dst[i_fwd] = dst_fwd
+        edge_w[i_fwd]   = counts[i]; edge_lbl[i_fwd] = last_base
 
-        e += 1
-        i_rev = e
-        edge_src[i_rev] = src_rev
-        edge_dst[i_rev] = dst_rev
-        edge_w[i_rev]   = count
-        edge_lbl[i_rev] = _complement_base(first_base)
+        edge_src[i_rev] = src_rev;  edge_dst[i_rev] = dst_rev
+        edge_w[i_rev]   = counts[i]; edge_lbl[i_rev] = _complement_base(first_base)
 
-        twin_temp[i_fwd] = i_rev
-        twin_temp[i_rev] = i_fwd
+        twin_temp[i_fwd] = Int32(i_rev)
+        twin_temp[i_rev] = Int32(i_fwd)
     end
 
-    # Sort by source. We need to permute everything in lockstep AND
-    # update twin pointers (since edge indices change).
-    perm = sortperm(edge_src)
-    edge_src_s = edge_src[perm]
-    edge_dst_s = edge_dst[perm]
-    edge_w_s   = edge_w[perm]
-    edge_lbl_s = edge_lbl[perm]
-
-    # inv_perm[old_idx] = new_idx
-    inv_perm = Vector{Int32}(undef, n_edges)
-    @inbounds for new_idx in 1:n_edges
-        inv_perm[perm[new_idx]] = Int32(new_idx)
-    end
-    edge_twins_s = Vector{Int32}(undef, n_edges)
-    @inbounds for new_idx in 1:n_edges
-        old_idx = perm[new_idx]
-        edge_twins_s[new_idx] = inv_perm[twin_temp[old_idx]]
-    end
-
-    # Build CSR offsets over 2*n_canonical oriented nodes.
-    n_oriented = 2 * n_canonical
+    # Counting sort by source node — O(E + N) vs O(E log E) for sortperm.
+    # Pass 1: histogram → cumulative offsets (1-based CSR).
     edge_offsets = zeros(Int32, n_oriented + 1)
-    for s in edge_src_s
-        edge_offsets[s + 1] += 1
+    @inbounds for e in 1:n_edges
+        edge_offsets[edge_src[e] + 1] += Int32(1)
     end
-    edge_offsets[1] = 1
-    for i in 2:(n_oriented + 1)
+    edge_offsets[1] = Int32(1)
+    @inbounds for i in 2:(n_oriented + 1)
         edge_offsets[i] += edge_offsets[i - 1]
+    end
+
+    # Pass 2: scatter edges into sorted output arrays.
+    # Record both directions of the permutation so twin pointers can be remapped:
+    #   inv_perm[old] = new  (old → sorted position)
+    #   perm[new]     = old  (sorted position → old)
+    edge_dst_s   = Vector{Int32}(undef, n_edges)
+    edge_w_s     = Vector{Int32}(undef, n_edges)
+    edge_lbl_s   = Vector{UInt8}(undef, n_edges)
+    inv_perm     = Vector{Int32}(undef, n_edges)
+    perm         = Vector{Int32}(undef, n_edges)
+    pos          = copy(edge_offsets)   # writing cursor per node (mutated in-place)
+    @inbounds for old in 1:n_edges
+        s        = edge_src[old]
+        new      = pos[s]
+        pos[s]   = new + Int32(1)
+        edge_dst_s[new]  = edge_dst[old]
+        edge_w_s[new]    = edge_w[old]
+        edge_lbl_s[new]  = edge_lbl[old]
+        inv_perm[old]    = new
+        perm[new]        = Int32(old)
+    end
+
+    # Remap twin pointers from pre-sort indices to post-sort indices.
+    edge_twins_s = Vector{Int32}(undef, n_edges)
+    @inbounds for new in 1:n_edges
+        edge_twins_s[new] = inv_perm[twin_temp[perm[new]]]
     end
 
     edge_alive = trues(n_edges)
@@ -204,45 +211,133 @@ Edges with weight < floor are killed (along with their twins).
 function remove_tips!(g::DeBruijnGraph;
                       tip_length::Int = 2 * g.k,
                       min_edge_weight::Int = 2,
-                      relative_threshold::Float64 = 0.05)
-    total_removed = 0
+                      relative_threshold::Float64 = 0.05,
+                      verbose::Bool = false)
+    n   = n_nodes(g)
+    n_e = length(g.edge_targets)
+
+    # Upload static arrays once — weights, twins, offsets never change after
+    # build_graph. Only edge_alive round-trips each pass.
+    weights_d = JACC.to_device(g.edge_weights)
+    twins_d   = JACC.to_device(g.edge_twins)
+    offsets_d = JACC.to_device(g.edge_offsets)
+    # Scratch buffers for relative prune (reused across convergence iterations).
+    src_d     = JACC.to_device(zeros(Int32, n_e))
+    max_d     = JACC.to_device(zeros(Int32, n))
+
+    # Floor prune is idempotent: edge weights never change, so one pass is enough.
+    t_floor = @elapsed removed_floor = _floor_prune!(g, min_edge_weight)
+    total_removed = removed_floor
+
+    # Relative prune loops until convergence.
+    t_rel = 0.0
+    iters = 0
     while true
-        removed = _simplify_pass!(g, min_edge_weight, relative_threshold)
-        total_removed += removed
-        removed == 0 && break
+        tr = @elapsed r = _relative_prune!(g, relative_threshold,
+                                           offsets_d, weights_d, twins_d,
+                                           src_d, max_d)
+        t_rel += tr
+        iters += 1
+        total_removed += r
+        r == 0 && break
+    end
+    if verbose
+        println("[graph/prune] floor=$(round(t_floor,digits=3))s  " *
+                "relative=$(round(t_rel,digits=3))s  iters=$iters")
     end
     return total_removed
 end
 
-function _simplify_pass!(g::DeBruijnGraph,
-                         min_edge_weight::Int,
-                         relative_threshold::Float64)
-    # Global maximum live edge weight.
-    max_w = Int32(0)
-    for e in 1:length(g.edge_targets)
-        g.edge_alive[e] || continue
-        g.edge_weights[e] > max_w && (max_w = g.edge_weights[e])
-    end
-    max_w == 0 && return 0
-
-    floor_w = max(Int32(min_edge_weight),
-                  Int32(ceil(relative_threshold * Float64(max_w))))
-
-    removed = 0
-    for e in 1:length(g.edge_targets)
-        g.edge_alive[e] || continue
-        if g.edge_weights[e] < floor_w
-            t = g.edge_twins[e]
-            g.edge_alive[e] = false
-            if g.edge_alive[t]
-                g.edge_alive[t] = false
-                removed += 1
-            end
-            removed += 1
+# JACC kernel: one thread per oriented node v. Scans v's own out-edge
+# range (disjoint across nodes — no races) to record each edge's source
+# and the strongest live out-edge weight at v.
+function _node_pass_kernel!(v, edge_offsets, edge_weights, edge_alive, edge_src, max_out_w)
+    lo = edge_offsets[v]
+    hi = edge_offsets[v + Int32(1)] - Int32(1)
+    m = Int32(0)
+    @inbounds for e in lo:hi
+        edge_src[e] = v
+        if edge_alive[e] != UInt8(0)
+            w = edge_weights[e]
+            w > m && (m = w)
         end
     end
-    return removed
+    max_out_w[v] = m
+    return nothing
 end
+
+# JACC kernel: one thread per edge. Kills edges (and twins) whose weight
+# falls below relative_threshold × the local max out-weight at their
+# source node. Same idempotent twin-write safety as _floor_prune_kernel!.
+function _relative_prune_kernel!(e, edge_weights, edge_twins, edge_src,
+                                  max_out_w, relative_threshold::Float32, edge_alive)
+    @inbounds begin
+        edge_alive[e] == UInt8(0) && return nothing
+        local_max = max_out_w[edge_src[e]]
+        local_max == Int32(0) && return nothing
+        # Float32 throughout — Metal shaders reject Float64 entirely.
+        if Float32(edge_weights[e]) < relative_threshold * Float32(local_max)
+            edge_alive[e] = UInt8(0)
+            edge_alive[edge_twins[e]] = UInt8(0)
+        end
+    end
+    return nothing
+end
+
+# Run the local relative-threshold pruning pass entirely on-device:
+# (1) per-node pass computes edge_src + local max out-weight,
+# (2) per-edge pass kills edges below relative_threshold × local max.
+# Writes results back into g.edge_alive; returns count of newly-dead edges.
+function _relative_prune!(g::DeBruijnGraph, relative_threshold::Float64,
+                          offsets_d, weights_d, twins_d, src_d, max_d)
+    n   = n_nodes(g)
+    n_e = length(g.edge_targets)
+    alive_before = count(g.edge_alive)
+
+    alive_d = JACC.to_device(UInt8.(g.edge_alive))
+
+    JACC.parallel_for(n, _node_pass_kernel!, offsets_d, weights_d, alive_d, src_d, max_d)
+    # Pass Float32 explicitly — Metal shaders reject Float64 kernel args.
+    JACC.parallel_for(n_e, _relative_prune_kernel!,
+        weights_d, twins_d, src_d, max_d, Float32(relative_threshold), alive_d)
+
+    alive_host = JACC.to_host(alive_d)
+    @inbounds for e in 1:n_e
+        g.edge_alive[e] = alive_host[e] != UInt8(0)
+    end
+    return alive_before - count(g.edge_alive)
+end
+
+# Floor prune runs entirely on CPU threads — no Metal dispatch overhead,
+# no device transfers, no BitVector word-level races.
+# Strategy: mark kills into a Vector{UInt8} scratch buffer (one byte per
+# edge, thread-safe for idempotent zeroing), then fold back into edge_alive.
+function _floor_prune!(g::DeBruijnGraph, min_edge_weight::Int)
+    n_e          = length(g.edge_targets)
+    alive_before = count(g.edge_alive)
+    w            = g.edge_weights
+    tw           = g.edge_twins
+    mw           = Int32(min_edge_weight)
+
+    # Scratch buffer: 1 = alive, 0 = dead. Start fully alive.
+    scratch = ones(UInt8, n_e)
+
+    # Each thread owns a disjoint set of edges (by index). The only shared
+    # writes are to twin slots, but twin pairs write the same value (0),
+    # so concurrent writes are idempotent — no race can corrupt state.
+    Threads.@threads for e in 1:n_e
+        @inbounds if w[e] < mw
+            scratch[e]      = UInt8(0)
+            scratch[tw[e]]  = UInt8(0)
+        end
+    end
+
+    @inbounds for e in 1:n_e
+        scratch[e] == UInt8(0) && (g.edge_alive[e] = false)
+    end
+    return alive_before - count(g.edge_alive)
+end
+
 
 # --- Unitig compaction ---
 #
@@ -270,107 +365,181 @@ n_unitigs(g::CompactedGraph) = length(g.edge_targets)
 Collapse maximal non-branching paths in the doubled-directed graph.
 Each unitig has a twin unitig representing the reverse-complement path.
 """
-function compact_unitigs(g::DeBruijnGraph)
-    n_or = n_nodes(g)   # = 2 * n_canonical
-    n_e  = length(g.edge_targets)
+# JACC kernel: one thread per oriented node v. Scans v's own out-edge
+# range (disjoint across nodes — no races) to label edge sources and
+# count live out-degree.
+function _node_degree_pass_kernel!(v, edge_offsets, edge_alive, edge_src, outdeg)
+    lo = edge_offsets[v]
+    hi = edge_offsets[v + Int32(1)] - Int32(1)
+    cnt = Int32(0)
+    @inbounds for e in lo:hi
+        edge_src[e] = v
+        edge_alive[e] != UInt8(0) && (cnt += Int32(1))
+    end
+    outdeg[v] = cnt
+    return nothing
+end
 
-    # Compute in/out degrees over LIVE edges.
-    indeg  = zeros(Int32, n_or)
-    outdeg = zeros(Int32, n_or)
-    edge_src = zeros(Int32, n_e)
-    for v in 1:n_or
-        for e in out_edges(g, v)
-            edge_src[e] = Int32(v)
+# JACC kernel: in-degree via the twin invariant — every live edge ending
+# at v has a twin edge starting at twin(v) (twin-paired pruning keeps
+# aliveness in sync), so indeg(v) == outdeg(twin(v)). This turns the
+# in-degree scatter (which would race across source nodes) into a
+# race-free elementwise gather.
+function _indeg_from_twin_kernel!(v, outdeg, indeg)
+    @inbounds indeg[v] = outdeg[twin(Int32(v))]
+    return nothing
+end
+
+# Compute (indeg, outdeg, edge_src) for the doubled-directed graph as
+# JACC parallel_for dispatches — see kernels above for the race-free
+# decomposition (per-node out-edge ranges + twin-invariant gather).
+function _compute_degrees_and_edge_src(g::DeBruijnGraph)
+    n   = n_nodes(g)
+    n_e = length(g.edge_targets)
+    edge_alive_u8 = UInt8.(g.edge_alive)
+
+    offsets_d = JACC.to_device(g.edge_offsets)
+    alive_d   = JACC.to_device(edge_alive_u8)
+    src_d     = JACC.to_device(zeros(Int32, n_e))
+    outdeg_d  = JACC.to_device(zeros(Int32, n))
+    JACC.parallel_for(n, _node_degree_pass_kernel!, offsets_d, alive_d, src_d, outdeg_d)
+
+    indeg_d = JACC.to_device(zeros(Int32, n))
+    JACC.parallel_for(n, _indeg_from_twin_kernel!, outdeg_d, indeg_d)
+
+    return JACC.to_host(indeg_d), JACC.to_host(outdeg_d), JACC.to_host(src_d)
+end
+
+function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false)
+    n_e = length(g.edge_targets)
+
+    t_deg = @elapsed indeg, outdeg, edge_src = _compute_degrees_and_edge_src(g)
+
+    # Phase 1: O(E) scan for non-cycle chain starts.
+    # A chain start is any alive edge whose source node is non-linear
+    # (indeg != 1 or outdeg != 1). Chains from distinct non-linear sources
+    # are structurally disjoint (a linear interior node has exactly one live
+    # predecessor, placing it in exactly one maximal chain), so no sequential
+    # chain-marking is needed to avoid duplicate starts.
+    t_starts = @elapsed begin
+        starts = Int32[]
+        for e in 1:n_e
             g.edge_alive[e] || continue
-            outdeg[v] += Int32(1)
-            indeg[g.edge_targets[e]] += Int32(1)
+            src = edge_src[e]
+            (indeg[src] != 1 || outdeg[src] != 1) || continue
+            push!(starts, Int32(e))
         end
     end
+    n_nc = length(starts)
 
-    visited = falses(n_e)
-    new_src     = Int32[]
-    new_dst     = Int32[]
-    new_weight  = Float32[]
-    new_seqs    = Vector{Vector{UInt8}}()
-    edge_to_unitig = zeros(Int32, n_e)   # which output unitig an edge ended up in
+    # Phase 2: parallel walks from non-cycle starts.
+    # Structurally disjoint chains -> threads write only to their own slot.
+    walk_src    = Vector{Int32}(undef, n_nc)
+    walk_dst    = Vector{Int32}(undef, n_nc)
+    walk_weight = Vector{Float32}(undef, n_nc)
+    walk_seqs   = Vector{Vector{UInt8}}(undef, n_nc)
+    walk_edges  = Vector{Vector{Int32}}(undef, n_nc)
 
-    function walk_forward(e_start::Integer)
-        bases   = UInt8[g.edge_labels[e_start]]
-        weights = Int32[g.edge_weights[e_start]]
-        edges_in_walk = Int32[Int32(e_start)]
-        visited[e_start] = true
+    t_walks = @elapsed Threads.@threads for i in 1:n_nc
+        e_start = starts[i]
+        local_visited = Set{Int32}()
+        bases         = UInt8[g.edge_labels[e_start]]
+        weights       = Int32[g.edge_weights[e_start]]
+        edges_in_walk = Int32[e_start]
+        push!(local_visited, e_start)
         cur_dst = g.edge_targets[e_start]
         while indeg[cur_dst] == 1 && outdeg[cur_dst] == 1
             next_e = Int32(0)
             for e in out_edges(g, cur_dst)
-                if g.edge_alive[e] && !visited[e]
+                if g.edge_alive[e] && !(Int32(e) in local_visited)
                     next_e = Int32(e); break
                 end
             end
             next_e == 0 && break
-            visited[next_e] = true
+            push!(local_visited, next_e)
             push!(edges_in_walk, next_e)
             push!(bases, g.edge_labels[next_e])
             push!(weights, g.edge_weights[next_e])
             cur_dst = g.edge_targets[next_e]
         end
-        return bases, weights, cur_dst, edges_in_walk
+        walk_src[i]    = edge_src[e_start]
+        walk_dst[i]    = cur_dst
+        walk_weight[i] = Float32(sum(weights)) / Float32(length(weights))
+        walk_seqs[i]   = bases
+        walk_edges[i]  = edges_in_walk
     end
 
-    function emit_walk(e_start::Integer)
-        src = edge_src[e_start]
-        bases, weights, final_dst, edges_in_walk = walk_forward(e_start)
-        push!(new_src, src)
-        push!(new_dst, final_dst)
-        push!(new_weight, Float32(sum(weights)) / Float32(length(weights)))
-        push!(new_seqs, bases)
-        u_idx = Int32(length(new_seqs))
-        for e in edges_in_walk
-            edge_to_unitig[e] = u_idx
-        end
-    end
-
-    # Pass 1: start walks at edges whose source is non-linear.
-    for e_start in 1:n_e
-        g.edge_alive[e_start] || continue
-        visited[e_start] && continue
-        src = edge_src[e_start]
-        (indeg[src] != 1 || outdeg[src] != 1) || continue
-        emit_walk(e_start)
-    end
-
-    # Pass 2: anything still unvisited belongs to a pure cycle of
-    # linear nodes — pick an arbitrary edge as the start.
-    for e_start in 1:n_e
-        g.edge_alive[e_start] || continue
-        visited[e_start] && continue
-        emit_walk(e_start)
-    end
-
-    # Build twin mapping for unitigs.
-    # The twin of a unitig is the unitig containing the twin of any of
-    # its edges (they should all map to the same twin unitig if the
-    # invariant holds).
-    n_u = length(new_seqs)
-    unitig_twins = Vector{Int32}(undef, n_u)
-    @inbounds for u in 1:n_u
-        # Find any edge in this unitig and look up where its twin landed.
-        # We don't have edges_in_walk stored, but edge_to_unitig is the
-        # inverse — scan for any edge belonging to u.
-        twin_u = Int32(0)
-        for e in 1:n_e
-            edge_to_unitig[e] == u || continue
-            t = g.edge_twins[e]
-            if edge_to_unitig[t] != 0
-                twin_u = edge_to_unitig[t]
-                break
+    # Phase 3: pure-cycle detection (sequential; rare in prokaryotic DBGs).
+    # Build a covered set from Phase 2 walks, then sweep for uncovered alive
+    # edges — each is a cycle start. Walk it to full coverage sequentially.
+    t_cycles = @elapsed begin
+        covered = falses(n_e)
+        for i in 1:n_nc
+            for e in walk_edges[i]
+                @inbounds covered[e] = true
             end
         end
-        unitig_twins[u] = twin_u
+        for e in 1:n_e
+            @inbounds g.edge_alive[e] || continue
+            @inbounds covered[e] && continue
+            cy_bases   = UInt8[g.edge_labels[e]]
+            cy_weights = Int32[g.edge_weights[e]]
+            cy_edges   = Int32[e]
+            covered[e] = true
+            cur_dst = g.edge_targets[e]
+            while indeg[cur_dst] == 1 && outdeg[cur_dst] == 1
+                next_e = 0
+                for ee in out_edges(g, cur_dst)
+                    g.edge_alive[ee] && !covered[ee] || continue
+                    next_e = ee; break
+                end
+                next_e == 0 && break
+                covered[next_e] = true
+                push!(cy_edges, Int32(next_e))
+                push!(cy_bases, g.edge_labels[next_e])
+                push!(cy_weights, g.edge_weights[next_e])
+                cur_dst = g.edge_targets[next_e]
+            end
+            push!(starts, Int32(e))
+            push!(walk_src, edge_src[e])
+            push!(walk_dst, cur_dst)
+            push!(walk_weight, Float32(sum(cy_weights)) / Float32(length(cy_weights)))
+            push!(walk_seqs, cy_bases)
+            push!(walk_edges, cy_edges)
+        end
+    end
+    n_walks = length(starts)
+
+    t_twin = @elapsed begin
+        edge_to_unitig = zeros(Int32, n_e)
+        for i in 1:n_walks
+            for e in walk_edges[i]
+                edge_to_unitig[e] = Int32(i)
+            end
+        end
+        unitig_twins = zeros(Int32, n_walks)
+        @inbounds for u in 1:n_walks
+            for e in walk_edges[u]
+                t = g.edge_twins[e]
+                if edge_to_unitig[t] != 0
+                    unitig_twins[u] = edge_to_unitig[t]
+                    break
+                end
+            end
+        end
+    end
+
+    if verbose
+        println("[graph/compact] degrees=$(round(t_deg,digits=3))s  " *
+                "starts=$(round(t_starts,digits=3))s  " *
+                "walks=$(round(t_walks,digits=3))s  " *
+                "cycles=$(round(t_cycles,digits=3))s  " *
+                "twin=$(round(t_twin,digits=3))s  " *
+                "n_unitigs=$n_walks")
     end
 
     return CompactedGraph(g.k, copy(g.canonical_kmers),
-                          new_src, new_dst, new_weight, new_seqs,
+                          walk_src, walk_dst, walk_weight, walk_seqs,
                           unitig_twins)
 end
 

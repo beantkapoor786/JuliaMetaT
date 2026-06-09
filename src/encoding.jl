@@ -80,32 +80,110 @@ function decode_read(seqs::AbstractMatrix{Int8},
 end
 
 """
-    load_fastq(paths...; drop_with_n=true) -> (seqs, lengths, n_dropped)
+    load_fastq(paths...; chunk_size=1_000_000, drop_with_n=true) -> (seqs, lengths, n_dropped)
 
 Read one or more FASTQ files (e.g., R1 and R2 for paired-end) and
 encode all reads into a single combined matrix. Files ending in `.gz`
-are transparently decompressed. Pair info is not retained at this layer.
+are transparently decompressed. Streams chunks internally to avoid
+holding all FASTX records in memory simultaneously; downstream API is
+unchanged from earlier versions.
 """
-function load_fastq(paths::AbstractString...; drop_with_n::Bool = true)
-    records = FASTX.FASTQ.Record[]
-    for p in paths
-        if endswith(lowercase(p), ".gz")
-            stream = CodecZlib.GzipDecompressorStream(open(p))
-            try
-                reader = FASTX.FASTQ.Reader(stream)
-                for rec in reader
-                    push!(records, rec)
+function load_fastq(paths::AbstractString...;
+                    chunk_size::Int = 1_000_000,
+                    drop_with_n::Bool = true)
+    chunks = NamedTuple[]
+    total_dropped = 0
+    max_len = 0
+    total_reads = 0
+
+    for chunk in stream_fastq(paths...; chunk_size, drop_with_n)
+        push!(chunks, chunk)
+        total_dropped += chunk.n_dropped
+        total_reads += length(chunk.lengths)
+        max_len = max(max_len, size(chunk.seqs, 1))
+    end
+
+    if total_reads == 0
+        return zeros(Int8, 0, 0), Int32[], total_dropped
+    end
+
+    # Allocate the final matrix once at known size; copy chunks in.
+    seqs    = zeros(Int8, max_len, total_reads)
+    lengths = Vector{Int32}(undef, total_reads)
+    offset  = 0
+    for chunk in chunks
+        n_chunk = length(chunk.lengths)
+        chunk_max_len = size(chunk.seqs, 1)
+        @views seqs[1:chunk_max_len, offset+1:offset+n_chunk] .= chunk.seqs
+        lengths[offset+1:offset+n_chunk] .= chunk.lengths
+        offset += n_chunk
+    end
+
+    return seqs, lengths, total_dropped
+end
+
+"""
+    stream_fastq(paths...; chunk_size=1_000_000, drop_with_n=true) -> Channel
+
+Stream FASTQ files in chunks. Each yielded value is a NamedTuple
+`(seqs, lengths, n_dropped)` where `seqs` is an `Int8` matrix of shape
+`(max_len_in_chunk × n_reads_in_chunk)`, `lengths` is a vector of read
+lengths, and `n_dropped` is the number of N-containing reads dropped
+from this chunk.
+
+Files ending in `.gz` are transparently decompressed. Streams are
+closed when the channel closes (normally or via exception).
+"""
+function stream_fastq(paths::AbstractString...;
+                      chunk_size::Int = 1_000_000,
+                      drop_with_n::Bool = true)
+    return Channel{NamedTuple}() do ch
+        readers_and_streams = Tuple{FASTX.FASTQ.Reader,Any}[]
+        try
+            for p in paths
+                if endswith(lowercase(p), ".gz")
+                    stream = CodecZlib.GzipDecompressorStream(open(p))
+                    push!(readers_and_streams, (FASTX.FASTQ.Reader(stream), stream))
+                else
+                    stream = open(p)
+                    push!(readers_and_streams, (FASTX.FASTQ.Reader(stream), stream))
                 end
-            finally
-                close(stream)
             end
-        else
-            open(FASTX.FASTQ.Reader, p) do r
-                for rec in r
-                    push!(records, rec)
+
+            buffer = FASTX.FASTQ.Record[]
+            sizehint!(buffer, chunk_size)
+
+            # Round-robin reading across paired files so chunks contain
+            # interleaved mates (matches existing load_fastq semantics:
+            # pair info isn't retained beyond this layer).
+            done = false
+            while !done
+                done = true
+                for (reader, _) in readers_and_streams
+                    if !eof(reader)
+                        done = false
+                        rec = FASTX.FASTQ.Record()
+                        read!(reader, rec)
+                        push!(buffer, rec)
+                        if length(buffer) >= chunk_size
+                            seqs, lengths, n_dropped = encode_reads(buffer; drop_with_n)
+                            put!(ch, (; seqs, lengths, n_dropped))
+                            empty!(buffer)
+                        end
+                    end
                 end
+            end
+
+            # Flush the final partial chunk.
+            if !isempty(buffer)
+                seqs, lengths, n_dropped = encode_reads(buffer; drop_with_n)
+                put!(ch, (; seqs, lengths, n_dropped))
+                empty!(buffer)
+            end
+        finally
+            for (_, stream) in readers_and_streams
+                close(stream)
             end
         end
     end
-    return encode_reads(records; drop_with_n)
 end
