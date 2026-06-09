@@ -1,0 +1,17 @@
+*.gz
+*.tsv
+
+# Julia
+.julia_depot/
+*.ji
+*.so
+*.dylib
+
+# Output
+output/
+contigs.fasta
+abundance.tsv
+
+# KMC temp files
+*.kmc_pre
+*.kmc_suf
