@@ -12,8 +12,8 @@
 #SBATCH --error=%x_%j.err
 
 # --- Fill in these absolute paths ---
-R1=/path/to/your_50M_R1.fastq.gz
-R2=/path/to/your_50M_R2.fastq.gz
+R1=/path/to/your_R1.fastq.gz
+R2=/path/to/your_R2.fastq.gz
 OUTDIR=/path/to/output
 PROJDIR=/path/to/julia-metat-experimental
 
@@ -27,8 +27,6 @@ export JULIA_DEPOT_PATH=$PROJDIR/.julia_depot:$JULIA_DEPOT_PATH
 export JULIA_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 # JACC CUDA backend — JACC will use the first visible GPU automatically.
-# On Pathfinder A2 nodes, --gres=gpu:2 gives 2 GPUs; JACC parallel_for
-# dispatches to CUDA device 0 by default.
 export JACC_BACKEND=cuda
 
 mkdir -p "$OUTDIR/fasta" "$OUTDIR/abundance"
