@@ -334,6 +334,116 @@ function map_reads(contigs::AbstractVector{Contig},
 end
 
 """
+    map_reads_streaming(contigs, paths...; k, min_hits, reads_per_batch, verbose, log_io)
+        -> (; raw_counts, n_reads, n_dropped, n_mapped)
+
+Streaming variant of `map_reads` for HPC-scale runs. Reads FASTQ files
+in `reads_per_batch`-sized chunks via `stream_fastq`, encodes and maps
+each chunk on-device, and accumulates per-contig raw counts directly.
+
+Unlike `map_reads`, this never materialises a full read matrix in RAM —
+peak host memory is O(reads_per_batch) rather than O(total_reads). Use
+this in the pipeline when total reads exceed available RAM.
+"""
+function map_reads_streaming(contigs::AbstractVector{Contig},
+                              paths::AbstractString...;
+                              k::Int            = 31,
+                              min_hits::Int      = 3,
+                              reads_per_batch::Int = 1_000_000,
+                              verbose::Bool      = false,
+                              log_io             = nothing)
+    n_contigs = length(contigs)
+    n_contigs == 0 && return (; raw_counts=Int[], n_reads=0, n_dropped=0, n_mapped=0)
+
+    sorted_kmers, contig_of_kmer = build_contig_kmer_index(contigs, k)
+    n_idx = length(sorted_kmers)
+    if n_idx == 0
+        return (; raw_counts=zeros(Int, n_contigs), n_reads=0, n_dropped=0, n_mapped=0)
+    end
+
+    sorted_kmers_d   = JACC.to_device(sorted_kmers)
+    contig_of_kmer_d = JACC.to_device(contig_of_kmer)
+
+    raw_counts   = zeros(Int, n_contigs)
+    n_reads      = 0
+    n_dropped    = 0
+    n_mapped     = 0
+    batch_num    = 0
+    t_start      = time()
+    log_every    = 25   # log every 25M reads at default batch size
+
+    for chunk in stream_fastq(paths...; chunk_size = reads_per_batch)
+        n_batch = length(chunk.lengths)
+        n_batch == 0 && continue
+
+        seqs_d    = JACC.to_device(chunk.seqs)
+        lengths_d = JACC.to_device(Int32.(chunk.lengths))
+        assign_d  = JACC.to_device(zeros(Int32, n_batch))
+        hits_d    = JACC.to_device(zeros(Int32, n_batch))
+
+        JACC.parallel_for(n_batch, _map_kernel_streaming!,
+            seqs_d, lengths_d, sorted_kmers_d, contig_of_kmer_d,
+            assign_d, hits_d,
+            Int32(n_idx), Int32(k), Int32(min_hits))
+
+        assign_h = JACC.to_host(assign_d)
+        @inbounds for a in assign_h
+            if a != Int32(0)
+                raw_counts[a] += 1
+                n_mapped += 1
+            end
+        end
+
+        n_reads   += n_batch
+        n_dropped += chunk.n_dropped
+        batch_num += 1
+
+        if verbose && batch_num % log_every == 0
+            elapsed = round(time() - t_start, digits=1)
+            log_println(log_io,
+                "[mapping] batch $batch_num  reads=$n_reads  mapped=$n_mapped  $(elapsed)s elapsed")
+        end
+    end
+
+    if verbose
+        elapsed = round(time() - t_start, digits=2)
+        pct     = round(100 * n_mapped / max(n_reads, 1), digits=1)
+        log_println(log_io,
+            "[mapping] reads_mapped=$n_mapped/$n_reads ($(pct)%)  ($(elapsed)s)")
+    end
+
+    return (; raw_counts, n_reads, n_dropped, n_mapped)
+end
+
+"""
+    compute_abundance(contigs, raw_counts) -> Vector{ContigAbundance}
+
+Compute RPKM and TPM from a pre-aggregated per-contig count vector.
+Use this with `map_reads_streaming`, which accumulates counts directly.
+"""
+function compute_abundance(contigs::AbstractVector{Contig},
+                           raw_counts::Vector{Int})
+    n_contigs    = length(contigs)
+    total_mapped = sum(raw_counts)
+    total_reads_M = max(total_mapped, 1) / 1e6
+
+    per_kb_rate = [raw_counts[c] / (length(contigs[c].sequence) / 1000.0)
+                   for c in 1:n_contigs]
+    sum_rate = sum(per_kb_rate)
+    sum_rate == 0 && (sum_rate = 1.0)
+
+    out = ContigAbundance[]
+    for c in 1:n_contigs
+        len  = length(contigs[c].sequence)
+        rpkm = raw_counts[c] / (len / 1000.0) / total_reads_M
+        tpm  = (per_kb_rate[c] / sum_rate) * 1e6
+        push!(out, ContigAbundance(c, len, raw_counts[c],
+                                   rpkm, tpm, contigs[c].mean_coverage))
+    end
+    return out
+end
+
+"""
     compute_abundance(contigs, assignments) -> Vector{ContigAbundance}
 
 Aggregate per-contig raw counts, RPKM, and TPM from read assignments.

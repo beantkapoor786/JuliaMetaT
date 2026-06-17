@@ -113,6 +113,25 @@ end
 
 # --- Per-component traversal ---
 
+# Adjacency helpers for small components: avoid Dict overhead for the common
+# case of 1–5 unitigs per component by using sorted parallel arrays.
+
+@inline function _find_outs(srcs::Vector{Int32}, unitigs::Vector{Int32},
+                             node::Int32)
+    # Linear scan over the component's src array — fast for small components.
+    result = Int32[]
+    @inbounds for i in eachindex(srcs)
+        srcs[i] == node && push!(result, unitigs[i])
+    end
+    return result
+end
+
+@inline function _in_degree(dsts::Vector{Int32}, node::Int32)
+    cnt = 0
+    @inbounds for d in dsts; d == node && (cnt += 1); end
+    return cnt
+end
+
 """
 Greedy highest-coverage traversal within a single component.
 Returns a vector of Contigs (usually 1, possibly more for branched components).
@@ -124,96 +143,96 @@ function traverse_component(cg::CompactedGraph,
     n_in_comp = length(unitigs_in_comp)
     n_in_comp == 0 && return Contig[]
 
-    # Build local adjacency: out-unitigs from each oriented node within this component.
-    # Use a Dict because node IDs can be sparse.
-    out_from = Dict{Int32,Vector{Int32}}()   # node -> list of unitig indices starting there
-    in_count = Dict{Int32,Int}()             # node -> number of unitigs ending there
-    for u in unitigs_in_comp
-        src = cg.edge_sources[u]
-        dst = cg.edge_targets[u]
-        push!(get!(out_from, src, Int32[]), u)
-        in_count[dst] = get(in_count, dst, 0) + 1
-    end
+    # Parallel src/dst arrays for this component (no Dict allocation).
+    srcs = [cg.edge_sources[u] for u in unitigs_in_comp]
+    dsts = [cg.edge_targets[u] for u in unitigs_in_comp]
 
-    # Sort each adjacency list by weight DESC, so popping picks highest first.
-    for (_, us) in out_from
-        sort!(us; by = u -> -cg.edge_weights[u])
+    # Build out-adjacency as sorted (by weight DESC) vectors per source node.
+    # Use a Dict only when the component is large enough to justify it.
+    use_dict = n_in_comp > 16
+    out_from  = use_dict ? Dict{Int32,Vector{Int32}}() : nothing
+    in_count  = use_dict ? Dict{Int32,Int}()            : nothing
+    if use_dict
+        for (i, u) in enumerate(unitigs_in_comp)
+            src = srcs[i]; dst = dsts[i]
+            push!(get!(out_from, src, Int32[]), u)
+            in_count[dst] = get(in_count, dst, 0) + 1
+        end
+        for (_, us) in out_from
+            sort!(us; by = u -> -cg.edge_weights[u])
+        end
     end
 
     visited = falses(n_unitigs(cg))
     contigs = Contig[]
 
     function emit_contig_from(start_u::Int32)
-        bases    = UInt8[]
-        weights  = Float32[]
+        # Pre-size buffers to avoid repeated realloc in the common short-chain case.
+        total_bases = sum(length(cg.edge_sequences[u]) for u in unitigs_in_comp)
+        bases    = Vector{UInt8}(); sizehint!(bases, total_bases)
+        weight_sum = 0.0f0
+        weight_len = 0
         u_count  = 0
-        chain    = Int32[]
 
-        # Source prefix: the (k-1)-mer at start_u's source node.
         prefix = node_to_string(cg, cg.edge_sources[start_u])
 
         cur_u = start_u
         while true
             visited[cur_u] && break
             visited[cur_u] = true
-            push!(chain, cur_u)
-            append!(bases, cg.edge_sequences[cur_u])
-            push!(weights, cg.edge_weights[cur_u])
+            seq_u = cg.edge_sequences[cur_u]
+            append!(bases, seq_u)
+            w = cg.edge_weights[cur_u]
+            l = length(seq_u)
+            weight_sum += w * Float32(l)
+            weight_len += l
             u_count += 1
 
-            # Move to next unitig: pick highest-weight unvisited out from this dst.
             dst = cg.edge_targets[cur_u]
-            cands = get(out_from, dst, Int32[])
             next_u = Int32(0)
-            for v in cands
-                if !visited[v]
-                    next_u = v; break
+            if use_dict
+                cands = get(out_from, dst, Int32[])
+                for v in cands
+                    if !visited[v]; next_u = v; break; end
+                end
+            else
+                # Linear scan for small components.
+                best_w = -1.0f0
+                @inbounds for i in eachindex(srcs)
+                    srcs[i] == dst || continue
+                    v = unitigs_in_comp[i]
+                    visited[v] && continue
+                    wv = cg.edge_weights[v]
+                    if wv > best_w; best_w = wv; next_u = v; end
                 end
             end
             next_u == 0 && break
             cur_u = next_u
         end
 
-        # Compose contig sequence: prefix + decoded bases.
         suffix_bytes = Vector{UInt8}(undef, length(bases))
         @inbounds for (i, b) in enumerate(bases)
             suffix_bytes[i] = b == 0x00 ? UInt8('A') : b == 0x01 ? UInt8('C') :
-                              b == 0x02 ? UInt8('G') : UInt8('T')
+                               b == 0x02 ? UInt8('G') : UInt8('T')
         end
         seq = prefix * String(suffix_bytes)
-
-        # Coverage: weighted mean by unitig length (longer unitigs dominate).
-        total_w = 0.0f0
-        total_len = 0
-        for (i, u) in enumerate(chain)
-            ulen = length(cg.edge_sequences[u])
-            total_w += weights[i] * Float32(ulen)
-            total_len += ulen
-        end
-        mean_cov = total_len == 0 ? 0.0f0 : total_w / Float32(total_len)
-
+        mean_cov = weight_len == 0 ? 0.0f0 : weight_sum / Float32(weight_len)
         return Contig(seq, mean_cov, u_count, Int(comp_id))
     end
 
-    # Pick starting unitigs: ones whose source has in_count == 0 (5' ends).
-    # If none, fall back to any unvisited unitig.
+    # Start from 5'-end unitigs (in_degree == 0 at their source node).
     sources = Int32[]
-    for u in unitigs_in_comp
-        src = cg.edge_sources[u]
-        if get(in_count, src, 0) == 0
-            push!(sources, u)
-        end
+    for (i, u) in enumerate(unitigs_in_comp)
+        src = srcs[i]
+        in_deg = use_dict ? get(in_count, src, 0) : _in_degree(dsts, src)
+        in_deg == 0 && push!(sources, u)
     end
-
-    # Sort sources by descending weight so we emit the strongest contig first.
     sort!(sources; by = u -> -cg.edge_weights[u])
 
     for s in sources
         visited[s] && continue
         push!(contigs, emit_contig_from(s))
     end
-
-    # Any leftover unvisited unitigs (cycles or branches we missed) → emit too.
     for u in unitigs_in_comp
         visited[u] && continue
         push!(contigs, emit_contig_from(u))
@@ -252,32 +271,51 @@ function traverse_contigs(cg::CompactedGraph)
 
     all_contigs = vcat(results...)
 
-    # De-duplicate twin contigs: for each contig, compute its canonical
-    # form (lex-min of forward vs rev-comp). Keep one per canonical form,
-    # preferring the longer contig (and the one whose sequence == canonical
-    # form if lengths tie, for determinism).
-    function _rc(s::AbstractString)
-        out = Vector{UInt8}(undef, length(s))
+    # De-duplicate twin contigs using hash-based dedup to avoid hashing full
+    # DNA strings (which is O(L) per contig and dominates at millions of contigs).
+    # Key: (h_fwd XOR h_rc, min(h_fwd, h_rc)) — order-independent pair hash.
+    # Collisions are resolved by full string comparison.
+    function _seq_hash(s::AbstractString)
+        h = UInt64(0xcbf29ce484222325)  # FNV-1a offset basis
+        @inbounds for c in s
+            h = xor(h, UInt64(c)) * UInt64(0x00000100000001b3)
+        end
+        h
+    end
+    function _rc_hash(s::AbstractString)
+        h = UInt64(0xcbf29ce484222325)
         L = length(s)
-        @inbounds for (i, c) in enumerate(s)
-            out[L - i + 1] =
-                c == 'A' ? UInt8('T') : c == 'T' ? UInt8('A') :
-                c == 'G' ? UInt8('C') : c == 'C' ? UInt8('G') : UInt8('N')
+        @inbounds for i in L:-1:1
+            c = s[i]
+            rc_c = c == 'A' ? 'T' : c == 'T' ? 'A' : c == 'G' ? 'C' : c == 'C' ? 'G' : 'N'
+            h = xor(h, UInt64(rc_c)) * UInt64(0x00000100000001b3)
         end
-        String(out)
+        h
     end
 
-    seen = Dict{String,Contig}()
+    # seen maps (xor_hash, min_hash) → index into deduped array
+    seen_idx = Dict{Tuple{UInt64,UInt64}, Int}()
+    sizehint!(seen_idx, length(all_contigs))
+    deduped = Contig[]
+    sizehint!(deduped, length(all_contigs) ÷ 2 + 1)
+
     for c in all_contigs
-        rev = _rc(c.sequence)
-        key = c.sequence <= rev ? c.sequence : rev
-        if !haskey(seen, key) ||
-           length(c.sequence) > length(seen[key].sequence)
-            seen[key] = c
+        hf = _seq_hash(c.sequence)
+        hr = _rc_hash(c.sequence)
+        key = (xor(hf, hr), min(hf, hr))
+        idx = get(seen_idx, key, 0)
+        if idx == 0
+            push!(deduped, c)
+            seen_idx[key] = length(deduped)
+        else
+            # Hash collision or genuine twin: keep longer (full string compare only on tie).
+            existing = deduped[idx]
+            if length(c.sequence) > length(existing.sequence)
+                deduped[idx] = c
+            end
         end
     end
 
-    deduped = collect(values(seen))
     sort!(deduped; by = c -> -length(c.sequence))
     return deduped
 end

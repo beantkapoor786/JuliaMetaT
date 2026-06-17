@@ -3,16 +3,18 @@
 """
     run_pipeline(r1_path, r2_path=nothing; k=31, min_count=2, ...,
                  out_fasta="contigs.fasta", out_tsv="abundance.tsv",
-                 out_dir=nothing,
+                 out_dir="output",
                  reads_per_batch=1_000_000, min_contig_length=100, verbose=true)
 
 End-to-end metatranscriptomics assembly. Reads FASTQ (paired-end if
 both paths given, single-end if only r1), runs the full pipeline,
 writes FASTA + TSV outputs. Returns (contigs, abundances).
 
-If `out_dir` is provided, a log file is written to `out_dir/log/pipeline.log`
-in append mode with a timestamped header. Stage timings, counts, and any
-errors (including stacktraces) are captured there.
+A log file is always written to `out_dir/log/pipeline.log` in append
+mode with a timestamped header. Stage timings, counts, and any errors
+(including stacktraces) are captured there. Reads are never fully
+materialised in RAM — mapping streams FASTQ in `reads_per_batch`-sized
+chunks so peak host memory is O(reads_per_batch), not O(total_reads).
 """
 function run_pipeline(r1_path::AbstractString,
                       r2_path::Union{AbstractString,Nothing} = nothing;
@@ -24,12 +26,12 @@ function run_pipeline(r1_path::AbstractString,
                       reads_per_batch::Int = 1_000_000,
                       out_fasta::AbstractString = "contigs.fasta",
                       out_tsv::AbstractString   = "abundance.tsv",
-                      out_dir::Union{AbstractString,Nothing} = nothing,
+                      out_dir::AbstractString = "output",
                       min_contig_length::Int = 100,
                       verbose::Bool = true)
     set_backend()
 
-    log_io = out_dir !== nothing ? open_log(out_dir) : nothing
+    log_io = open_log(out_dir)
 
     try
         _run_pipeline_inner(r1_path, r2_path;
@@ -38,10 +40,10 @@ function run_pipeline(r1_path::AbstractString,
             verbose, log_io)
     catch err
         msg = sprint(showerror, err, catch_backtrace())
-        log_io !== nothing && (println(log_io, "\nERROR\n", msg); flush(log_io))
+        println(log_io, "\nERROR\n", msg); flush(log_io)
         rethrow()
     finally
-        log_io !== nothing && close(log_io)
+        close(log_io)
     end
 end
 
@@ -56,12 +58,6 @@ function _run_pipeline_inner(r1_path, r2_path;
     emit("params: k=$k  min_count=$min_count  min_edge_weight=$min_edge_weight  relative_threshold=$relative_threshold  min_hits=$min_hits  min_contig_length=$min_contig_length")
 
     paths = r2_path === nothing ? (r1_path,) : (r1_path, r2_path)
-
-    t_load = @elapsed begin
-        seqs_h, lengths_h, n_dropped = load_fastq(paths...)
-    end
-    n_reads = size(seqs_h, 2)
-    emit("[load]    n_reads=$n_reads n_dropped=$n_dropped  ($(round(t_load, digits=3))s)")
 
     t_kmer = @elapsed begin
         uniq, cnts = count_kmers_kmc(r1_path, r2_path;
@@ -88,11 +84,12 @@ function _run_pipeline_inner(r1_path, r2_path;
     end
 
     t_map = @elapsed begin
-        assignments, hits = map_reads(contigs, seqs_h, lengths_h; k = k, min_hits = min_hits, reads_per_batch = reads_per_batch, verbose = verbose, log_io = log_io)
-        abundances = compute_abundance(contigs, assignments)
+        result    = map_reads_streaming(contigs, paths...; k = k, min_hits = min_hits,
+                                        reads_per_batch = reads_per_batch,
+                                        verbose = verbose, log_io = log_io)
+        abundances = compute_abundance(contigs, result.raw_counts)
     end
-    n_mapped = count(>(0), assignments)
-    emit("[mapping] reads_mapped=$n_mapped/$n_reads ($(round(100*n_mapped/n_reads, digits=1))%)  ($(round(t_map, digits=3))s)")
+    emit("[mapping] reads_mapped=$(result.n_mapped)/$(result.n_reads) ($(round(100*result.n_mapped/max(result.n_reads,1), digits=1))%) dropped=$(result.n_dropped)  ($(round(t_map, digits=3))s)")
 
     write_contigs_fasta(out_fasta, contigs; min_length = min_contig_length)
     write_abundance_tsv(out_tsv, abundances; min_length = min_contig_length)

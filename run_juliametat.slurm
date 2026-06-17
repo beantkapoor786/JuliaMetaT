@@ -6,12 +6,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:2
-#SBATCH --mem=256G
-#SBATCH --time=04:00:00
+#SBATCH --mem=900G
+#SBATCH --time=12:00:00
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 
-# --- Fill in these absolute paths ---
+# --- Fill in these paths ---
 R1=/path/to/your_R1.fastq.gz
 R2=/path/to/your_R2.fastq.gz
 OUTDIR=/path/to/output
@@ -20,16 +20,18 @@ PROJDIR=/path/to/julia-metat-experimental
 # --- Load modules (adjust to your cluster's module names) ---
 module load julia/1.12
 module load kmc/3
-module load cuda
+module load cuda   # required for JACC CUDA backend on A2 nodes
 
 # --- Julia depot / package cache (avoids re-precompiling every run) ---
 export JULIA_DEPOT_PATH=$PROJDIR/.julia_depot:$JULIA_DEPOT_PATH
 export JULIA_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 # JACC CUDA backend — JACC will use the first visible GPU automatically.
+# On Pathfinder A2 nodes, --gres=gpu:2 gives 2 GPUs; JACC parallel_for
+# dispatches to CUDA device 0 by default.
 export JACC_BACKEND=cuda
 
-mkdir -p "$OUTDIR/fasta" "$OUTDIR/abundance"
+mkdir -p "$OUTDIR/fasta" "$OUTDIR/abundance" "$OUTDIR/log"
 
 cd "$PROJDIR"
 
@@ -48,8 +50,10 @@ run_pipeline(
     relative_threshold = 0.05,
     min_hits           = 3,
     min_contig_length  = 100,
+    reads_per_batch    = 1_000_000,
     out_fasta          = \"$OUTDIR/fasta/contigs.fasta\",
     out_tsv            = \"$OUTDIR/abundance/abundance.tsv\",
+    out_dir            = \"$OUTDIR\",
     verbose            = true,
 )
 "
