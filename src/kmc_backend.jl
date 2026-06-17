@@ -149,52 +149,71 @@ function _parse_dump_chunk(buf::Vector{UInt8}, byte_start::Int, byte_end::Int, k
     return uniq, counts
 end
 
-# K-way merge of N sorted (uniq, counts) chunks. Same-key entries are
-# summed (which shouldn't happen at this layer since KMC has already
-# deduped, but canonicalization can in principle merge a forward and
-# rev-comp k-mer from different chunks).
+# Binary min-heap sift-down for (kmer, chunk_idx) pairs ordered by kmer.
+@inline function _heap_sift_down!(heap::Vector{Tuple{UInt64,Int}}, i::Int)
+    n = length(heap)
+    @inbounds while true
+        left  = 2i
+        right = 2i + 1
+        smallest = i
+        left  <= n && heap[left][1]  < heap[smallest][1] && (smallest = left)
+        right <= n && heap[right][1] < heap[smallest][1] && (smallest = right)
+        smallest == i && break
+        heap[i], heap[smallest] = heap[smallest], heap[i]
+        i = smallest
+    end
+end
+
+# K-way merge of N sorted (uniq, counts) chunks using a binary min-heap.
+# O(N log K) vs the naive O(N×K) linear scan. Same-key entries are summed
+# (canonicalization can merge a forward and rev-comp k-mer from different chunks).
 function _merge_sorted_chunks(chunks::Vector{Tuple{Vector{UInt64},Vector{Int32}}})
     n_chunks = length(chunks)
     n_chunks == 0 && return UInt64[], Int32[]
     n_chunks == 1 && return chunks[1]
 
-    # Total size for pre-allocation
     total = sum(length(c[1]) for c in chunks)
     uniq   = Vector{UInt64}(undef, total)
     counts = Vector{Int32}(undef, total)
 
-    # Position cursors into each chunk
-    idx = ones(Int, n_chunks)
+    idx  = ones(Int, n_chunks)
     lens = [length(c[1]) for c in chunks]
 
-    out_i = 0
-    while true
-        # Find the smallest current k-mer across chunks
-        best_chunk = 0
-        best_val   = typemax(UInt64)
-        @inbounds for c in 1:n_chunks
-            if idx[c] <= lens[c]
-                v = chunks[c][1][idx[c]]
-                if v < best_val
-                    best_val = v
-                    best_chunk = c
-                end
-            end
-        end
-        best_chunk == 0 && break
+    # Seed heap with first element from each non-empty chunk.
+    heap = Tuple{UInt64,Int}[]
+    sizehint!(heap, n_chunks)
+    for c in 1:n_chunks
+        lens[c] > 0 && push!(heap, (chunks[c][1][1], c))
+    end
+    for i in (length(heap) ÷ 2):-1:1
+        _heap_sift_down!(heap, i)
+    end
 
-        # Sum counts for any chunks with the same k-mer at the cursor
-        cnt_sum = Int32(0)
-        @inbounds for c in 1:n_chunks
-            if idx[c] <= lens[c] && chunks[c][1][idx[c]] == best_val
-                cnt_sum += chunks[c][2][idx[c]]
-                idx[c] += 1
+    out_i = 0
+    @inbounds while !isempty(heap)
+        best_val = heap[1][1]
+        cnt_sum  = Int32(0)
+
+        # Drain all heap entries with this kmer value (usually just one;
+        # duplicates arise only when canonicalization maps two chunks to
+        # the same canonical k-mer).
+        while !isempty(heap) && heap[1][1] == best_val
+            c = heap[1][2]
+            cnt_sum += chunks[c][2][idx[c]]
+            idx[c] += 1
+            if idx[c] <= lens[c]
+                heap[1] = (chunks[c][1][idx[c]], c)
+                _heap_sift_down!(heap, 1)
+            else
+                heap[1] = heap[end]
+                pop!(heap)
+                !isempty(heap) && _heap_sift_down!(heap, 1)
             end
         end
 
         out_i += 1
-        @inbounds uniq[out_i]   = best_val
-        @inbounds counts[out_i] = cnt_sum
+        uniq[out_i]   = best_val
+        counts[out_i] = cnt_sum
     end
 
     resize!(uniq,   out_i)
@@ -233,7 +252,8 @@ function count_kmers_kmc(r1::AbstractString, r2::Union{AbstractString,Nothing}=n
                          threads::Int = Threads.nthreads(),
                          memory_gb::Int = 8,
                          workdir::AbstractString = mktempdir(),
-                         verbose::Bool = false)
+                         verbose::Bool = false,
+                         log_io = nothing)
     check_kmc()
     mkpath(workdir)
 
@@ -253,12 +273,12 @@ function count_kmers_kmc(r1::AbstractString, r2::Union{AbstractString,Nothing}=n
             -k$k -ci$min_count -cs$max_count
             -t$threads -m$memory_gb -fq
             @$fof $db $workdir`, stdout=devnull, stderr=devnull))
-        verbose && println("[kmc]     count: $(round(t_count, digits=2))s")
+        verbose && log_println(log_io, "[kmc]     count: $(round(t_count, digits=2))s")
 
         # Step 3: dump to text, sorted
         t_dump = @elapsed run(pipeline(`$KMC_TOOLS_BINARY transform $db dump -s $dump_path`,
                                        stdout=devnull, stderr=devnull))
-        verbose && println("[kmc]     dump:  $(round(t_dump, digits=2))s")
+        verbose && log_println(log_io, "[kmc]     dump:  $(round(t_dump, digits=2))s")
 
         # Step 4: parallel parse via mmap
         t_parse = @elapsed begin
@@ -283,7 +303,7 @@ function count_kmers_kmc(r1::AbstractString, r2::Union{AbstractString,Nothing}=n
 
             uniq, counts = _merge_sorted_chunks(chunks_results)
         end
-        verbose && println("[kmc]     parse: $(round(t_parse, digits=2))s ($threads threads)")
+        verbose && log_println(log_io, "[kmc]     parse: $(round(t_parse, digits=2))s ($threads threads)")
 
         # Sanity: detect max_count clipping
         if !isempty(counts) && maximum(counts) == max_count

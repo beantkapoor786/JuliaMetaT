@@ -1,5 +1,2 @@
 [JACC]
-backends = ["threads"]
-default_backend = "threads"
-
-    [JACC.placement]
+backends = ["metal"]

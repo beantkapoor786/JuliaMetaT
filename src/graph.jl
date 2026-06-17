@@ -212,7 +212,8 @@ function remove_tips!(g::DeBruijnGraph;
                       tip_length::Int = 2 * g.k,
                       min_edge_weight::Int = 2,
                       relative_threshold::Float64 = 0.05,
-                      verbose::Bool = false)
+                      verbose::Bool = false,
+                      log_io = nothing)
     n   = n_nodes(g)
     n_e = length(g.edge_targets)
 
@@ -229,20 +230,24 @@ function remove_tips!(g::DeBruijnGraph;
     t_floor = @elapsed removed_floor = _floor_prune!(g, min_edge_weight)
     total_removed = removed_floor
 
+    # Upload alive once after floor prune. Relative prune keeps it on device
+    # across iterations — no re-upload per iteration, only one to_host per iter.
+    alive_d = JACC.to_device(UInt8.(g.edge_alive))
+
     # Relative prune loops until convergence.
     t_rel = 0.0
     iters = 0
     while true
         tr = @elapsed r = _relative_prune!(g, relative_threshold,
                                            offsets_d, weights_d, twins_d,
-                                           src_d, max_d)
+                                           src_d, max_d, alive_d)
         t_rel += tr
         iters += 1
         total_removed += r
         r == 0 && break
     end
     if verbose
-        println("[graph/prune] floor=$(round(t_floor,digits=3))s  " *
+        log_println(log_io, "[graph/prune] floor=$(round(t_floor,digits=3))s  " *
                 "relative=$(round(t_rel,digits=3))s  iters=$iters")
     end
     return total_removed
@@ -287,14 +292,13 @@ end
 # Run the local relative-threshold pruning pass entirely on-device:
 # (1) per-node pass computes edge_src + local max out-weight,
 # (2) per-edge pass kills edges below relative_threshold × local max.
+# alive_d is owned by remove_tips! and persists across iterations — this
+# function reads/writes it in-place without re-uploading from host.
 # Writes results back into g.edge_alive; returns count of newly-dead edges.
 function _relative_prune!(g::DeBruijnGraph, relative_threshold::Float64,
-                          offsets_d, weights_d, twins_d, src_d, max_d)
+                          offsets_d, weights_d, twins_d, src_d, max_d, alive_d)
     n   = n_nodes(g)
     n_e = length(g.edge_targets)
-    alive_before = count(g.edge_alive)
-
-    alive_d = JACC.to_device(UInt8.(g.edge_alive))
 
     JACC.parallel_for(n, _node_pass_kernel!, offsets_d, weights_d, alive_d, src_d, max_d)
     # Pass Float32 explicitly — Metal shaders reject Float64 kernel args.
@@ -302,10 +306,14 @@ function _relative_prune!(g::DeBruijnGraph, relative_threshold::Float64,
         weights_d, twins_d, src_d, max_d, Float32(relative_threshold), alive_d)
 
     alive_host = JACC.to_host(alive_d)
+    killed = 0
     @inbounds for e in 1:n_e
-        g.edge_alive[e] = alive_host[e] != UInt8(0)
+        was = g.edge_alive[e]
+        now = alive_host[e] != UInt8(0)
+        g.edge_alive[e] = now
+        was & !now && (killed += 1)
     end
-    return alive_before - count(g.edge_alive)
+    return killed
 end
 
 # Floor prune runs entirely on CPU threads — no Metal dispatch overhead,
@@ -313,11 +321,10 @@ end
 # Strategy: mark kills into a Vector{UInt8} scratch buffer (one byte per
 # edge, thread-safe for idempotent zeroing), then fold back into edge_alive.
 function _floor_prune!(g::DeBruijnGraph, min_edge_weight::Int)
-    n_e          = length(g.edge_targets)
-    alive_before = count(g.edge_alive)
-    w            = g.edge_weights
-    tw           = g.edge_twins
-    mw           = Int32(min_edge_weight)
+    n_e = length(g.edge_targets)
+    w   = g.edge_weights
+    tw  = g.edge_twins
+    mw  = Int32(min_edge_weight)
 
     # Scratch buffer: 1 = alive, 0 = dead. Start fully alive.
     scratch = ones(UInt8, n_e)
@@ -332,10 +339,14 @@ function _floor_prune!(g::DeBruijnGraph, min_edge_weight::Int)
         end
     end
 
+    killed = 0
     @inbounds for e in 1:n_e
-        scratch[e] == UInt8(0) && (g.edge_alive[e] = false)
+        if scratch[e] == UInt8(0) && g.edge_alive[e]
+            g.edge_alive[e] = false
+            killed += 1
+        end
     end
-    return alive_before - count(g.edge_alive)
+    return killed
 end
 
 
@@ -410,7 +421,7 @@ function _compute_degrees_and_edge_src(g::DeBruijnGraph)
     return JACC.to_host(indeg_d), JACC.to_host(outdeg_d), JACC.to_host(src_d)
 end
 
-function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false)
+function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothing)
     n_e = length(g.edge_targets)
 
     t_deg = @elapsed indeg, outdeg, edge_src = _compute_degrees_and_edge_src(g)
@@ -423,6 +434,7 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false)
     # chain-marking is needed to avoid duplicate starts.
     t_starts = @elapsed begin
         starts = Int32[]
+        sizehint!(starts, n_e ÷ 4)
         for e in 1:n_e
             g.edge_alive[e] || continue
             src = edge_src[e]
@@ -442,29 +454,29 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false)
 
     t_walks = @elapsed Threads.@threads for i in 1:n_nc
         e_start = starts[i]
-        local_visited = Set{Int32}()
         bases         = UInt8[g.edge_labels[e_start]]
-        weights       = Int32[g.edge_weights[e_start]]
         edges_in_walk = Int32[e_start]
-        push!(local_visited, e_start)
+        weight_sum    = Int32(g.edge_weights[e_start])
+        weight_count  = Int32(1)
         cur_dst = g.edge_targets[e_start]
+        # local_visited not needed: linear chains (indeg==outdeg==1) can never
+        # loop back — a back-edge to any prior node would give that node indeg>1,
+        # breaking the while condition before we could revisit it.
         while indeg[cur_dst] == 1 && outdeg[cur_dst] == 1
             next_e = Int32(0)
             for e in out_edges(g, cur_dst)
-                if g.edge_alive[e] && !(Int32(e) in local_visited)
-                    next_e = Int32(e); break
-                end
+                g.edge_alive[e] && (next_e = Int32(e); break)
             end
             next_e == 0 && break
-            push!(local_visited, next_e)
             push!(edges_in_walk, next_e)
             push!(bases, g.edge_labels[next_e])
-            push!(weights, g.edge_weights[next_e])
+            weight_sum   += g.edge_weights[next_e]
+            weight_count += Int32(1)
             cur_dst = g.edge_targets[next_e]
         end
         walk_src[i]    = edge_src[e_start]
         walk_dst[i]    = cur_dst
-        walk_weight[i] = Float32(sum(weights)) / Float32(length(weights))
+        walk_weight[i] = Float32(weight_sum) / Float32(weight_count)
         walk_seqs[i]   = bases
         walk_edges[i]  = edges_in_walk
     end
@@ -482,9 +494,10 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false)
         for e in 1:n_e
             @inbounds g.edge_alive[e] || continue
             @inbounds covered[e] && continue
-            cy_bases   = UInt8[g.edge_labels[e]]
-            cy_weights = Int32[g.edge_weights[e]]
-            cy_edges   = Int32[e]
+            cy_bases      = UInt8[g.edge_labels[e]]
+            cy_edges      = Int32[e]
+            cy_weight_sum = Int32(g.edge_weights[e])
+            cy_weight_cnt = Int32(1)
             covered[e] = true
             cur_dst = g.edge_targets[e]
             while indeg[cur_dst] == 1 && outdeg[cur_dst] == 1
@@ -497,13 +510,14 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false)
                 covered[next_e] = true
                 push!(cy_edges, Int32(next_e))
                 push!(cy_bases, g.edge_labels[next_e])
-                push!(cy_weights, g.edge_weights[next_e])
+                cy_weight_sum += g.edge_weights[next_e]
+                cy_weight_cnt += Int32(1)
                 cur_dst = g.edge_targets[next_e]
             end
             push!(starts, Int32(e))
             push!(walk_src, edge_src[e])
             push!(walk_dst, cur_dst)
-            push!(walk_weight, Float32(sum(cy_weights)) / Float32(length(cy_weights)))
+            push!(walk_weight, Float32(cy_weight_sum) / Float32(cy_weight_cnt))
             push!(walk_seqs, cy_bases)
             push!(walk_edges, cy_edges)
         end
@@ -530,7 +544,7 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false)
     end
 
     if verbose
-        println("[graph/compact] degrees=$(round(t_deg,digits=3))s  " *
+        log_println(log_io, "[graph/compact] degrees=$(round(t_deg,digits=3))s  " *
                 "starts=$(round(t_starts,digits=3))s  " *
                 "walks=$(round(t_walks,digits=3))s  " *
                 "cycles=$(round(t_cycles,digits=3))s  " *
@@ -568,12 +582,12 @@ Reconstruct the full DNA sequence of a unitig: the source node's
 function unitig_sequence(g::CompactedGraph, u::Integer)
     src = g.edge_sources[u]
     prefix = node_to_string(g, src)
-    suffix_chars = Vector{Char}(undef, length(g.edge_sequences[u]))
+    suffix_bytes = Vector{UInt8}(undef, length(g.edge_sequences[u]))
     @inbounds for (i, b) in enumerate(g.edge_sequences[u])
-        suffix_chars[i] = b == 0 ? 'A' :
-                          b == 1 ? 'C' :
-                          b == 2 ? 'G' :
-                                   'T'
+        suffix_bytes[i] = b == 0x00 ? UInt8('A') :
+                          b == 0x01 ? UInt8('C') :
+                          b == 0x02 ? UInt8('G') :
+                                      UInt8('T')
     end
-    return prefix * String(suffix_chars)
+    return prefix * String(suffix_bytes)
 end

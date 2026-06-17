@@ -14,13 +14,20 @@ function __init__()
 end
 
 """
-Read JACC's configured backend from Preferences. Returns one of
-`:cuda`, `:amdgpu`, `:metal`, `:oneapi`, `:threads`, or `:unknown`.
+Read JACC's configured backend. Priority order:
+1. `JACC_BACKEND` environment variable (allows SLURM scripts to set the backend
+   without modifying LocalPreferences.toml in the project directory)
+2. JACC's LocalPreferences.toml entry (`default_backend`)
+3. Fall back to `threads`
+
+Returns one of `:cuda`, `:amdgpu`, `:metal`, `:oneapi`, `:threads`.
 """
 function _detect_active_backend()
+    env_val = get(ENV, "JACC_BACKEND", "")
+    if !isempty(env_val)
+        return Symbol(lowercase(strip(env_val)))
+    end
     s = try
-        # JACC stores its default backend in LocalPreferences.toml under
-        # the "JACC" UUID. The key is "default_backend".
         load_preference(Base.UUID("0979c8fe-16a4-4796-9b82-89a9f10403ea"),
                         "default_backend", "threads")
     catch
@@ -49,11 +56,12 @@ active backend cannot be changed at runtime.
 function set_backend(; force::Symbol = :auto)
     chosen = _BACKEND[]
 
-    msg = chosen === :cuda    ? "Backend: NVIDIA CUDA" :
-          chosen === :amdgpu  ? "Backend: AMD ROCm"    :
-          chosen === :metal   ? "Backend: Apple Metal" :
-          chosen === :threads ? "Backend: CPU Threads" :
-                                "Backend: $chosen"
+    env_src = !isempty(get(ENV, "JACC_BACKEND", "")) ? " (from JACC_BACKEND env)" : ""
+    msg = chosen === :cuda    ? "Backend: NVIDIA CUDA$env_src" :
+          chosen === :amdgpu  ? "Backend: AMD ROCm$env_src"    :
+          chosen === :metal   ? "Backend: Apple Metal$env_src" :
+          chosen === :threads ? "Backend: CPU Threads$env_src" :
+                                "Backend: $chosen$env_src"
 
     if force !== :auto && force !== chosen
         @warn "Requested backend `$force` differs from active backend `$chosen`. " *

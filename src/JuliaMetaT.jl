@@ -4,6 +4,7 @@ using FASTX
 using JACC
 using Random
 using CodecZlib
+using Dates
 
 include("backend.jl")
 include("encoding.jl")
@@ -41,7 +42,7 @@ export Contig, find_components, traverse_contigs
 # Round 4
 export ContigAbundance
 export build_contig_kmer_index, map_reads, compute_abundance
-export write_contigs_fasta, write_abundance_tsv
+export write_contigs_fasta, write_abundance_tsv, open_log, log_println
 
 # Pipeline
 export run_pipeline

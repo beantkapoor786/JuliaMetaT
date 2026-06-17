@@ -1,4 +1,35 @@
-# FASTA + TSV output writers.
+# FASTA + TSV output writers, and pipeline log helpers.
+
+"""
+    open_log(out_dir) -> IO
+
+Open (or create) a plain-text log file at `out_dir/log/pipeline.log` in append
+mode. Writes a timestamped run header so multiple runs are separated cleanly.
+"""
+function open_log(out_dir::AbstractString)
+    log_dir = joinpath(out_dir, "log")
+    mkpath(log_dir)
+    path = joinpath(log_dir, "pipeline.log")
+    io = open(path, "a")
+    println(io, "\n", "="^72)
+    println(io, "RUN  ", Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS"))
+    println(io, "="^72)
+    flush(io)
+    return io
+end
+
+"""
+    log_println(log_io, msg)
+
+Print `msg` to stdout and to `log_io` (if not nothing), then flush.
+"""
+@inline function log_println(log_io, msg::AbstractString)
+    println(msg)
+    if log_io !== nothing
+        println(log_io, msg)
+        flush(log_io)
+    end
+end
 
 """
     write_contigs_fasta(path, contigs; min_length=0)

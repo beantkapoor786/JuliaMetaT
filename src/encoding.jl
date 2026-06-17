@@ -25,58 +25,71 @@ function encode_reads(records::AbstractVector{<:FASTX.FASTQ.Record};
     n = length(records)
     n == 0 && return (zeros(Int8, 0, 0), Int32[], 0)
 
-    keep = trues(n)
-    max_len = 0
-    @inbounds for (j, r) in enumerate(records)
-        s = FASTX.sequence(r)
-        L = length(s)
+    # Single pass: encode each record once. Kept reads store their encoded
+    # buffer; dropped reads get an empty sentinel. This eliminates the
+    # duplicate FASTX.sequence() + codeunits() + encode_base() calls that
+    # the old two-pass approach did for every kept read.
+    encoded   = Vector{Vector{Int8}}(undef, n)
+    lengths   = Vector{Int32}(undef, n)
+    keep      = trues(n)
+    max_len   = 0
+    n_dropped = 0
+
+    @inbounds for j in 1:n
+        s  = FASTX.sequence(records[j])
         sb = codeunits(s)
-        contains_n = false
+        L  = length(sb)
+        buf = Vector{Int8}(undef, L)
+        has_n = false
         for i in 1:L
-            if encode_base(sb[i]) == BASE_N
-                contains_n = true
-                break
-            end
+            b = encode_base(sb[i])
+            buf[i] = b
+            b == BASE_N && (has_n = true)
         end
-        if drop_with_n && contains_n
+        if drop_with_n && has_n
             keep[j] = false
+            n_dropped += 1
+            encoded[j] = Int8[]
         else
+            encoded[j] = buf
+            lengths[j] = Int32(L)
             L > max_len && (max_len = L)
         end
     end
 
-    n_kept = count(keep)
-    n_dropped = n - n_kept
+    n_kept = n - n_dropped
     n_kept == 0 && return (zeros(Int8, 0, 0), Int32[], n_dropped)
 
-    seqs    = zeros(Int8, max_len, n_kept)
-    lengths = zeros(Int32, n_kept)
-
+    seqs        = zeros(Int8, max_len, n_kept)
+    out_lengths = Vector{Int32}(undef, n_kept)
     col = 0
     @inbounds for j in 1:n
         keep[j] || continue
         col += 1
-        s = FASTX.sequence(records[j])
-        sb = codeunits(s)
-        L = length(s)
-        lengths[col] = L
+        buf = encoded[j]
+        L   = Int(lengths[j])
+        out_lengths[col] = Int32(L)
         for i in 1:L
-            seqs[i, col] = encode_base(sb[i])
+            seqs[i, col] = buf[i]
         end
     end
 
-    return seqs, lengths, n_dropped
+    return seqs, out_lengths, n_dropped
 end
 
 function decode_read(seqs::AbstractMatrix{Int8},
                      lengths::AbstractVector{<:Integer},
                      j::Integer)
     L = Int(lengths[j])
-    chars = Vector{Char}(undef, L)
+    bytes = Vector{UInt8}(undef, L)
     @inbounds for i in 1:L
-        chars[i] = decode_base(seqs[i, j])
+        b = seqs[i, j]
+        bytes[i] = b == BASE_A ? UInt8('A') :
+                   b == BASE_T ? UInt8('T') :
+                   b == BASE_G ? UInt8('G') :
+                   b == BASE_C ? UInt8('C') : UInt8('N')
     end
-    return String(chars)
+    return String(bytes)
 end
 
 """

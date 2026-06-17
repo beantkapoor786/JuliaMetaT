@@ -140,7 +140,7 @@ function traverse_component(cg::CompactedGraph,
         sort!(us; by = u -> -cg.edge_weights[u])
     end
 
-    visited = Set{Int32}()
+    visited = falses(n_unitigs(cg))
     contigs = Contig[]
 
     function emit_contig_from(start_u::Int32)
@@ -154,8 +154,8 @@ function traverse_component(cg::CompactedGraph,
 
         cur_u = start_u
         while true
-            (cur_u in visited) && break
-            push!(visited, cur_u)
+            visited[cur_u] && break
+            visited[cur_u] = true
             push!(chain, cur_u)
             append!(bases, cg.edge_sequences[cur_u])
             push!(weights, cg.edge_weights[cur_u])
@@ -166,7 +166,7 @@ function traverse_component(cg::CompactedGraph,
             cands = get(out_from, dst, Int32[])
             next_u = Int32(0)
             for v in cands
-                if !(v in visited)
+                if !visited[v]
                     next_u = v; break
                 end
             end
@@ -175,12 +175,12 @@ function traverse_component(cg::CompactedGraph,
         end
 
         # Compose contig sequence: prefix + decoded bases.
-        suffix_chars = Vector{Char}(undef, length(bases))
+        suffix_bytes = Vector{UInt8}(undef, length(bases))
         @inbounds for (i, b) in enumerate(bases)
-            suffix_chars[i] = b == 0 ? 'A' : b == 1 ? 'C' :
-                              b == 2 ? 'G' : 'T'
+            suffix_bytes[i] = b == 0x00 ? UInt8('A') : b == 0x01 ? UInt8('C') :
+                              b == 0x02 ? UInt8('G') : UInt8('T')
         end
-        seq = prefix * String(suffix_chars)
+        seq = prefix * String(suffix_bytes)
 
         # Coverage: weighted mean by unitig length (longer unitigs dominate).
         total_w = 0.0f0
@@ -209,13 +209,13 @@ function traverse_component(cg::CompactedGraph,
     sort!(sources; by = u -> -cg.edge_weights[u])
 
     for s in sources
-        s in visited && continue
+        visited[s] && continue
         push!(contigs, emit_contig_from(s))
     end
 
     # Any leftover unvisited unitigs (cycles or branches we missed) → emit too.
     for u in unitigs_in_comp
-        u in visited && continue
+        visited[u] && continue
         push!(contigs, emit_contig_from(u))
     end
 
@@ -257,12 +257,12 @@ function traverse_contigs(cg::CompactedGraph)
     # preferring the longer contig (and the one whose sequence == canonical
     # form if lengths tie, for determinism).
     function _rc(s::AbstractString)
-        out = Vector{Char}(undef, length(s))
+        out = Vector{UInt8}(undef, length(s))
         L = length(s)
         @inbounds for (i, c) in enumerate(s)
             out[L - i + 1] =
-                c == 'A' ? 'T' : c == 'T' ? 'A' :
-                c == 'G' ? 'C' : c == 'C' ? 'G' : 'N'
+                c == 'A' ? UInt8('T') : c == 'T' ? UInt8('A') :
+                c == 'G' ? UInt8('C') : c == 'C' ? UInt8('G') : UInt8('N')
         end
         String(out)
     end

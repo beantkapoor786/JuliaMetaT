@@ -2,7 +2,7 @@
 
 A de novo metatranscriptomic assembler for prokaryotic communities, written in Julia. It is built around a doubled-directed de Bruijn graph and uses [JACC.jl](https://github.com/JuliaParallel/JACC.jl) for backend-agnostic parallelism, so the same code runs on CPU threads, NVIDIA GPUs (CUDA), AMD GPUs (ROCm), and Apple Metal without modification.
 
-The project targets real environmental metatranscriptomes at 50M+ read pairs, where reference genomes are unavailable and transcript abundance varies over a wide dynamic range.
+The project targets real environmental metatranscriptomes at 2B+ read pairs, where reference genomes are unavailable and transcript abundance varies over a wide dynamic range.
 
 ---
 
@@ -121,7 +121,7 @@ The test suite covers encoding, k-mer extraction, KMC3 agreement, graph construc
 | Read mapping | 2.1s |
 | **Total** | **~16.6s** |
 
-Mapping rate on real ribodepleted data: ~91%. The graph and pruning stages use JACC kernels and scale to GPU backends for larger datasets.
+Mapping rate on real ribodepleted data: ~91%. The graph and pruning stages use JACC kernels and scale to GPU backends for larger datasets. The scalability design target is 2B read pairs (4B total reads) on HPC nodes with 1 TB RAM; the primary engineering milestone before that scale is chunked GPU dispatch in the mapping stage (current implementation uploads the full read matrix to GPU VRAM in one shot).
 
 ---
 

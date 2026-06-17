@@ -120,15 +120,15 @@ end
 # Test/debug helpers.
 
 function kmer_to_string(kmer::UInt64, k::Int)
-    chars = Vector{Char}(undef, k)
+    bytes = Vector{UInt8}(undef, k)
     @inbounds for i in 0:(k-1)
         bits = (kmer >> (2 * (k - 1 - i))) & UInt64(0x3)
-        chars[i+1] = bits == 0 ? 'A' :
-                     bits == 1 ? 'C' :
-                     bits == 2 ? 'G' :
-                                 'T'
+        bytes[i+1] = bits == 0x0 ? UInt8('A') :
+                     bits == 0x1 ? UInt8('C') :
+                     bits == 0x2 ? UInt8('G') :
+                                   UInt8('T')
     end
-    return String(chars)
+    return String(bytes)
 end
 
 function string_to_canonical_kmer(s::AbstractString, k::Int)

@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "bb1e18ebe5ba1e695d35baba8a62525d5986d943"
+project_hash = "4cd7f11a52a974524476c9f921f238331efe595a"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -102,7 +102,7 @@ version = "1.2.0"
     oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
 
 [[deps.JuliaMetaT]]
-deps = ["CodecZlib", "FASTX", "JACC", "Preferences", "Random"]
+deps = ["CodecZlib", "FASTX", "JACC", "Mmap", "Preferences", "Random"]
 path = "."
 uuid = "a4f2e8c1-9d3b-4e7a-b6c2-1f8e5d3a9c47"
 version = "0.1.0"
