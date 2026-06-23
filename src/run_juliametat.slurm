@@ -1,0 +1,70 @@
+#!/bin/bash
+#SBATCH --job-name=juliametat
+#SBATCH --account=YOUR_ACCOUNT
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --gres=gpu:1
+#SBATCH --mem=750G
+#SBATCH --time=12:00:00
+#SBATCH --output=%x_%j.out
+#SBATCH --error=%x_%j.err
+
+# --- Fill in these paths ---
+R1=/path/to/your_R1.fastq.gz
+R2=/path/to/your_R2.fastq.gz
+OUTDIR=/path/to/output
+PROJDIR=/path/to/julia-metat-experimental
+
+# KMC3 scratch directory for intermediate external-memory database files.
+# Must NOT be /tmp (typically a small local disk on compute nodes, unrelated
+# to --mem). Use the Lustre scratch filesystem, with a unique per-job
+# subdirectory so concurrent jobs don't collide.
+KMC_WORKDIR=/scratch/$USER/juliametat_kmc_$SLURM_JOB_ID
+
+# --- Load modules (adjust to your cluster's module names) ---
+module load julia/1.12
+module load kmc/3
+module load cuda   # required for JACC CUDA backend on A2 nodes
+
+# --- Julia depot / package cache (avoids re-precompiling every run) ---
+export JULIA_DEPOT_PATH=$PROJDIR/.julia_depot:$JULIA_DEPOT_PATH
+export JULIA_NUM_THREADS=$SLURM_CPUS_PER_TASK
+
+# JACC CUDA backend — JACC will use the first visible GPU automatically.
+# On Pathfinder A2 nodes, --gres=gpu:2 gives 2 GPUs; JACC parallel_for
+# dispatches to CUDA device 0 by default.
+export JACC_BACKEND=cuda
+
+mkdir -p "$OUTDIR/fasta" "$OUTDIR/abundance" "$OUTDIR/log"
+mkdir -p "$KMC_WORKDIR"
+
+cd "$PROJDIR"
+
+# Instantiate (no-op if depot is warm)
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
+
+julia --project=. \
+      -t $SLURM_CPUS_PER_TASK \
+      -e "
+using JuliaMetaT
+run_pipeline(
+    \"$R1\", \"$R2\";
+    k                  = 31,
+    min_count          = 2,
+    min_edge_weight    = 2,
+    relative_threshold = 0.05,
+    min_hits           = 3,
+    min_contig_length  = 100,
+    reads_per_batch    = 1_000_000,
+    out_fasta          = \"$OUTDIR/fasta/contigs.fasta\",
+    out_tsv            = \"$OUTDIR/abundance/abundance.tsv\",
+    out_dir            = \"$OUTDIR\",
+    kmc_workdir        = \"$KMC_WORKDIR\",
+    verbose            = true,
+)
+"
+
+# Clean up KMC scratch directory on success.
+rm -rf "$KMC_WORKDIR"

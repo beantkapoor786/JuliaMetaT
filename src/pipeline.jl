@@ -15,6 +15,13 @@ mode with a timestamped header. Stage timings, counts, and any errors
 (including stacktraces) are captured there. Reads are never fully
 materialised in RAM — mapping streams FASTQ in `reads_per_batch`-sized
 chunks so peak host memory is O(reads_per_batch), not O(total_reads).
+
+`kmc_workdir` sets KMC3's scratch directory for its external-memory
+intermediate files (defaults to `mktempdir()`, i.e. `/tmp`, if omitted).
+On HPC, `/tmp` is typically a small local filesystem unrelated to the
+job's `--mem` allocation — pass a large scratch filesystem path (e.g.
+Lustre `/scratch/...`) explicitly for multi-billion-read runs, or KMC
+will fail with a silent `ProcessExited(1)` when the disk fills.
 """
 function run_pipeline(r1_path::AbstractString,
                       r2_path::Union{AbstractString,Nothing} = nothing;
@@ -28,6 +35,7 @@ function run_pipeline(r1_path::AbstractString,
                       out_tsv::AbstractString   = "abundance.tsv",
                       out_dir::AbstractString = "output",
                       min_contig_length::Int = 100,
+                      kmc_workdir::Union{AbstractString,Nothing} = nothing,
                       verbose::Bool = true)
     set_backend()
 
@@ -37,7 +45,7 @@ function run_pipeline(r1_path::AbstractString,
         _run_pipeline_inner(r1_path, r2_path;
             k, min_count, min_edge_weight, relative_threshold,
             min_hits, reads_per_batch, out_fasta, out_tsv, min_contig_length,
-            verbose, log_io)
+            kmc_workdir, verbose, log_io)
     catch err
         msg = sprint(showerror, err, catch_backtrace())
         println(log_io, "\nERROR\n", msg); flush(log_io)
@@ -50,7 +58,7 @@ end
 function _run_pipeline_inner(r1_path, r2_path;
                              k, min_count, min_edge_weight, relative_threshold,
                              min_hits, reads_per_batch, out_fasta, out_tsv,
-                             min_contig_length, verbose, log_io)
+                             min_contig_length, kmc_workdir, verbose, log_io)
     emit(msg) = verbose && log_println(log_io, msg)
 
     emit("r1=$(r1_path)")
@@ -59,9 +67,11 @@ function _run_pipeline_inner(r1_path, r2_path;
 
     paths = r2_path === nothing ? (r1_path,) : (r1_path, r2_path)
 
+    kmc_kwargs = kmc_workdir === nothing ? (;) : (; workdir = kmc_workdir)
     t_kmer = @elapsed begin
         uniq, cnts = count_kmers_kmc(r1_path, r2_path;
-            k = k, min_count = min_count, verbose = verbose, log_io = log_io)
+            k = k, min_count = min_count, verbose = verbose, log_io = log_io,
+            kmc_kwargs...)
     end
     emit("[kmers]   unique≥$(min_count)=$(length(uniq))  ($(round(t_kmer, digits=3))s)")
 

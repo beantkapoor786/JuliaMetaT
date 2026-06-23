@@ -268,16 +268,24 @@ function count_kmers_kmc(r1::AbstractString, r2::Union{AbstractString,Nothing}=n
         db = joinpath(workdir, "db")
         dump_path = joinpath(workdir, "dump.txt")
 
+        # KMC's own stdout/stderr are captured to the pipeline log (rather than
+        # discarded) so a process failure (e.g. exit code 1 from a full scratch
+        # disk) is diagnosable from the log instead of just "ProcessExited(1)".
+        kmc_out = log_io === nothing ? devnull : log_io
+        kmc_err = log_io === nothing ? devnull : log_io
+        log_io !== nothing && flush(log_io)
+
         # Step 2: run KMC
         t_count = @elapsed run(pipeline(`$KMC_BINARY
             -k$k -ci$min_count -cs$max_count
             -t$threads -m$memory_gb -fq
-            @$fof $db $workdir`, stdout=devnull, stderr=devnull))
+            @$fof $db $workdir`, stdout=kmc_out, stderr=kmc_err))
         verbose && log_println(log_io, "[kmc]     count: $(round(t_count, digits=2))s")
 
         # Step 3: dump to text, sorted
+        log_io !== nothing && flush(log_io)
         t_dump = @elapsed run(pipeline(`$KMC_TOOLS_BINARY transform $db dump -s $dump_path`,
-                                       stdout=devnull, stderr=devnull))
+                                       stdout=kmc_out, stderr=kmc_err))
         verbose && log_println(log_io, "[kmc]     dump:  $(round(t_dump, digits=2))s")
 
         # Step 4: parallel parse via mmap
