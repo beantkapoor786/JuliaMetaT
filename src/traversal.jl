@@ -10,17 +10,17 @@ end
 # --- Union-find ---
 
 mutable struct UnionFind
-    parent::Vector{Int32}
+    parent::Vector{Int64}   # indexed by canonical k-mer index — can exceed 2^31 at HPC scale
     rank::Vector{Int32}
 end
-UnionFind(n::Integer) = UnionFind(Int32.(1:n), zeros(Int32, n))
+UnionFind(n::Integer) = UnionFind(Int64.(1:n), zeros(Int32, n))
 
 function uf_find(uf::UnionFind, x::Integer)
     while uf.parent[x] != x
         uf.parent[x] = uf.parent[uf.parent[x]]   # path compression
         x = uf.parent[x]
     end
-    return Int32(x)
+    return Int64(x)
 end
 
 function uf_union!(uf::UnionFind, a::Integer, b::Integer)
@@ -61,13 +61,14 @@ function find_components(cg::CompactedGraph)
 
     # Each unitig's component = the find-root of its source's canonical idx.
     # Compact the root labels to a dense 1..n_components range.
-    raw_comp = Vector{Int32}(undef, n_u)
+    raw_comp = Vector{Int64}(undef, n_u)
     for u in 1:n_u
         raw_comp[u] = uf_find(uf, canonical_idx(cg.edge_sources[u]))
     end
 
     unique_roots = sort!(unique(raw_comp))
-    root_to_id = Dict{Int32,Int32}(r => Int32(i) for (i, r) in enumerate(unique_roots))
+    # Component count is bounded by n_unitigs (Int32-safe), so comp ids stay Int32.
+    root_to_id = Dict{Int64,Int32}(r => Int32(i) for (i, r) in enumerate(unique_roots))
     comp_of_unitig = [root_to_id[r] for r in raw_comp]
 
     return comp_of_unitig, length(unique_roots)
@@ -116,8 +117,8 @@ end
 # Adjacency helpers for small components: avoid Dict overhead for the common
 # case of 1–5 unitigs per component by using sorted parallel arrays.
 
-@inline function _find_outs(srcs::Vector{Int32}, unitigs::Vector{Int32},
-                             node::Int32)
+@inline function _find_outs(srcs::Vector{Int64}, unitigs::Vector{Int32},
+                             node::Int64)
     # Linear scan over the component's src array — fast for small components.
     result = Int32[]
     @inbounds for i in eachindex(srcs)
@@ -126,7 +127,7 @@ end
     return result
 end
 
-@inline function _in_degree(dsts::Vector{Int32}, node::Int32)
+@inline function _in_degree(dsts::Vector{Int64}, node::Int64)
     cnt = 0
     @inbounds for d in dsts; d == node && (cnt += 1); end
     return cnt
@@ -150,8 +151,8 @@ function traverse_component(cg::CompactedGraph,
     # Build out-adjacency as sorted (by weight DESC) vectors per source node.
     # Use a Dict only when the component is large enough to justify it.
     use_dict = n_in_comp > 16
-    out_from  = use_dict ? Dict{Int32,Vector{Int32}}() : nothing
-    in_count  = use_dict ? Dict{Int32,Int}()            : nothing
+    out_from  = use_dict ? Dict{Int64,Vector{Int32}}() : nothing
+    in_count  = use_dict ? Dict{Int64,Int}()            : nothing
     if use_dict
         for (i, u) in enumerate(unitigs_in_comp)
             src = srcs[i]; dst = dsts[i]

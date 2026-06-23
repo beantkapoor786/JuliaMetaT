@@ -17,19 +17,22 @@
 struct DeBruijnGraph
     k::Int
     canonical_kmers::Vector{UInt64}    # canonical (k-1)-mer per canonical index
-    edge_offsets::Vector{Int32}        # length = 2*n_canonical + 1
-    edge_targets::Vector{Int32}        # destination oriented node ID
+    edge_offsets::Vector{Int64}        # length = 2*n_canonical + 1
+    edge_targets::Vector{Int64}        # destination oriented node ID
     edge_weights::Vector{Int32}        # k-mer count
     edge_labels::Vector{UInt8}         # base 0..3 emitted by traversing
-    edge_twins::Vector{Int32}          # index of this edge's twin edge
+    edge_twins::Vector{Int64}          # index of this edge's twin edge
     edge_alive::BitVector
 end
 
-@inline twin(v::Integer) = isodd(v) ? Int32(v + 1) : Int32(v - 1)
-@inline forward_id(canonical_idx::Integer) = Int32(2 * canonical_idx - 1)
-@inline reverse_id(canonical_idx::Integer) = Int32(2 * canonical_idx)
+# Node/edge IDs use Int64: at HPC scale (billions of unique k-mers), the
+# number of canonical (k-1)-mers and the number of edges both exceed the
+# Int32 range (2^31-1) — see 5B-read-pair run with 17.9B unique k-mers.
+@inline twin(v::Integer) = isodd(v) ? Int64(v + 1) : Int64(v - 1)
+@inline forward_id(canonical_idx::Integer) = Int64(2 * canonical_idx - 1)
+@inline reverse_id(canonical_idx::Integer) = Int64(2 * canonical_idx)
 @inline is_forward(v::Integer) = isodd(v)
-@inline canonical_idx(v::Integer) = Int32((v + 1) ÷ 2)
+@inline canonical_idx(v::Integer) = Int64((v + 1) ÷ 2)
 
 n_nodes(g::DeBruijnGraph) = 2 * length(g.canonical_kmers)
 
@@ -121,11 +124,11 @@ function build_graph(uniq_kmers::Vector{UInt64},
     # embarrassingly parallel — each iteration writes only to its own pair.
     n_edges    = 2 * n_kmers
     n_oriented = 2 * n_canonical
-    edge_src  = Vector{Int32}(undef, n_edges)
-    edge_dst  = Vector{Int32}(undef, n_edges)
+    edge_src  = Vector{Int64}(undef, n_edges)
+    edge_dst  = Vector{Int64}(undef, n_edges)
     edge_w    = Vector{Int32}(undef, n_edges)
     edge_lbl  = Vector{UInt8}(undef, n_edges)
-    twin_temp = Vector{Int32}(undef, n_edges)
+    twin_temp = Vector{Int64}(undef, n_edges)
 
     Threads.@threads for i in 1:n_kmers
         i_fwd = 2i - 1
@@ -143,17 +146,17 @@ function build_graph(uniq_kmers::Vector{UInt64},
         edge_src[i_rev] = src_rev;  edge_dst[i_rev] = dst_rev
         edge_w[i_rev]   = counts[i]; edge_lbl[i_rev] = _complement_base(first_base)
 
-        twin_temp[i_fwd] = Int32(i_rev)
-        twin_temp[i_rev] = Int32(i_fwd)
+        twin_temp[i_fwd] = Int64(i_rev)
+        twin_temp[i_rev] = Int64(i_fwd)
     end
 
     # Counting sort by source node — O(E + N) vs O(E log E) for sortperm.
     # Pass 1: histogram → cumulative offsets (1-based CSR).
-    edge_offsets = zeros(Int32, n_oriented + 1)
+    edge_offsets = zeros(Int64, n_oriented + 1)
     @inbounds for e in 1:n_edges
-        edge_offsets[edge_src[e] + 1] += Int32(1)
+        edge_offsets[edge_src[e] + 1] += Int64(1)
     end
-    edge_offsets[1] = Int32(1)
+    edge_offsets[1] = Int64(1)
     @inbounds for i in 2:(n_oriented + 1)
         edge_offsets[i] += edge_offsets[i - 1]
     end
@@ -162,25 +165,25 @@ function build_graph(uniq_kmers::Vector{UInt64},
     # Record both directions of the permutation so twin pointers can be remapped:
     #   inv_perm[old] = new  (old → sorted position)
     #   perm[new]     = old  (sorted position → old)
-    edge_dst_s   = Vector{Int32}(undef, n_edges)
+    edge_dst_s   = Vector{Int64}(undef, n_edges)
     edge_w_s     = Vector{Int32}(undef, n_edges)
     edge_lbl_s   = Vector{UInt8}(undef, n_edges)
-    inv_perm     = Vector{Int32}(undef, n_edges)
-    perm         = Vector{Int32}(undef, n_edges)
+    inv_perm     = Vector{Int64}(undef, n_edges)
+    perm         = Vector{Int64}(undef, n_edges)
     pos          = copy(edge_offsets)   # writing cursor per node (mutated in-place)
     @inbounds for old in 1:n_edges
         s        = edge_src[old]
         new      = pos[s]
-        pos[s]   = new + Int32(1)
+        pos[s]   = new + Int64(1)
         edge_dst_s[new]  = edge_dst[old]
         edge_w_s[new]    = edge_w[old]
         edge_lbl_s[new]  = edge_lbl[old]
         inv_perm[old]    = new
-        perm[new]        = Int32(old)
+        perm[new]        = Int64(old)
     end
 
     # Remap twin pointers from pre-sort indices to post-sort indices.
-    edge_twins_s = Vector{Int32}(undef, n_edges)
+    edge_twins_s = Vector{Int64}(undef, n_edges)
     @inbounds for new in 1:n_edges
         edge_twins_s[new] = inv_perm[twin_temp[perm[new]]]
     end
@@ -223,7 +226,7 @@ function remove_tips!(g::DeBruijnGraph;
     twins_d   = JACC.to_device(g.edge_twins)
     offsets_d = JACC.to_device(g.edge_offsets)
     # Scratch buffers for relative prune (reused across convergence iterations).
-    src_d     = JACC.to_device(zeros(Int32, n_e))
+    src_d     = JACC.to_device(zeros(Int64, n_e))
     max_d     = JACC.to_device(zeros(Int32, n))
 
     # Floor prune is idempotent: edge weights never change, so one pass is enough.
@@ -258,7 +261,7 @@ end
 # and the strongest live out-edge weight at v.
 function _node_pass_kernel!(v, edge_offsets, edge_weights, edge_alive, edge_src, max_out_w)
     lo = edge_offsets[v]
-    hi = edge_offsets[v + Int32(1)] - Int32(1)
+    hi = edge_offsets[v + Int64(1)] - Int64(1)
     m = Int32(0)
     @inbounds for e in lo:hi
         edge_src[e] = v
@@ -360,11 +363,11 @@ end
 struct CompactedGraph
     k::Int
     canonical_kmers::Vector{UInt64}     # same canonical (k-1)-mer table as parent
-    edge_sources::Vector{Int32}         # source oriented node ID per unitig
-    edge_targets::Vector{Int32}         # destination oriented node ID per unitig
+    edge_sources::Vector{Int64}         # source oriented node ID per unitig
+    edge_targets::Vector{Int64}         # destination oriented node ID per unitig
     edge_weights::Vector{Float32}       # mean coverage along the unitig
     edge_sequences::Vector{Vector{UInt8}}  # appended bases (0..3) per unitig
-    edge_twins::Vector{Int32}           # index of this unitig's twin
+    edge_twins::Vector{Int32}           # index of this unitig's twin (unitig count stays Int32-bounded)
 end
 
 n_canonical(g::CompactedGraph) = length(g.canonical_kmers)
@@ -381,7 +384,7 @@ Each unitig has a twin unitig representing the reverse-complement path.
 # count live out-degree.
 function _node_degree_pass_kernel!(v, edge_offsets, edge_alive, edge_src, outdeg)
     lo = edge_offsets[v]
-    hi = edge_offsets[v + Int32(1)] - Int32(1)
+    hi = edge_offsets[v + Int64(1)] - Int64(1)
     cnt = Int32(0)
     @inbounds for e in lo:hi
         edge_src[e] = v
@@ -397,7 +400,7 @@ end
 # in-degree scatter (which would race across source nodes) into a
 # race-free elementwise gather.
 function _indeg_from_twin_kernel!(v, outdeg, indeg)
-    @inbounds indeg[v] = outdeg[twin(Int32(v))]
+    @inbounds indeg[v] = outdeg[twin(v)]
     return nothing
 end
 
@@ -411,7 +414,7 @@ function _compute_degrees_and_edge_src(g::DeBruijnGraph)
 
     offsets_d = JACC.to_device(g.edge_offsets)
     alive_d   = JACC.to_device(edge_alive_u8)
-    src_d     = JACC.to_device(zeros(Int32, n_e))
+    src_d     = JACC.to_device(zeros(Int64, n_e))
     outdeg_d  = JACC.to_device(zeros(Int32, n))
     JACC.parallel_for(n, _node_degree_pass_kernel!, offsets_d, alive_d, src_d, outdeg_d)
 
@@ -433,29 +436,29 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
     # predecessor, placing it in exactly one maximal chain), so no sequential
     # chain-marking is needed to avoid duplicate starts.
     t_starts = @elapsed begin
-        starts = Int32[]
+        starts = Int64[]
         sizehint!(starts, n_e ÷ 4)
         for e in 1:n_e
             g.edge_alive[e] || continue
             src = edge_src[e]
             (indeg[src] != 1 || outdeg[src] != 1) || continue
-            push!(starts, Int32(e))
+            push!(starts, Int64(e))
         end
     end
     n_nc = length(starts)
 
     # Phase 2: parallel walks from non-cycle starts.
     # Structurally disjoint chains -> threads write only to their own slot.
-    walk_src    = Vector{Int32}(undef, n_nc)
-    walk_dst    = Vector{Int32}(undef, n_nc)
+    walk_src    = Vector{Int64}(undef, n_nc)
+    walk_dst    = Vector{Int64}(undef, n_nc)
     walk_weight = Vector{Float32}(undef, n_nc)
     walk_seqs   = Vector{Vector{UInt8}}(undef, n_nc)
-    walk_edges  = Vector{Vector{Int32}}(undef, n_nc)
+    walk_edges  = Vector{Vector{Int64}}(undef, n_nc)
 
     t_walks = @elapsed Threads.@threads for i in 1:n_nc
         e_start = starts[i]
         bases         = UInt8[g.edge_labels[e_start]]
-        edges_in_walk = Int32[e_start]
+        edges_in_walk = Int64[e_start]
         weight_sum    = Int32(g.edge_weights[e_start])
         weight_count  = Int32(1)
         cur_dst = g.edge_targets[e_start]
@@ -463,9 +466,9 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
         # loop back — a back-edge to any prior node would give that node indeg>1,
         # breaking the while condition before we could revisit it.
         while indeg[cur_dst] == 1 && outdeg[cur_dst] == 1
-            next_e = Int32(0)
+            next_e = Int64(0)
             for e in out_edges(g, cur_dst)
-                g.edge_alive[e] && (next_e = Int32(e); break)
+                g.edge_alive[e] && (next_e = Int64(e); break)
             end
             next_e == 0 && break
             push!(edges_in_walk, next_e)
@@ -495,7 +498,7 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
             @inbounds g.edge_alive[e] || continue
             @inbounds covered[e] && continue
             cy_bases      = UInt8[g.edge_labels[e]]
-            cy_edges      = Int32[e]
+            cy_edges      = Int64[e]
             cy_weight_sum = Int32(g.edge_weights[e])
             cy_weight_cnt = Int32(1)
             covered[e] = true
@@ -508,13 +511,13 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
                 end
                 next_e == 0 && break
                 covered[next_e] = true
-                push!(cy_edges, Int32(next_e))
+                push!(cy_edges, Int64(next_e))
                 push!(cy_bases, g.edge_labels[next_e])
                 cy_weight_sum += g.edge_weights[next_e]
                 cy_weight_cnt += Int32(1)
                 cur_dst = g.edge_targets[next_e]
             end
-            push!(starts, Int32(e))
+            push!(starts, Int64(e))
             push!(walk_src, edge_src[e])
             push!(walk_dst, cur_dst)
             push!(walk_weight, Float32(cy_weight_sum) / Float32(cy_weight_cnt))
