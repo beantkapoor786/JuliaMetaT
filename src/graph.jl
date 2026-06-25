@@ -98,7 +98,7 @@ function build_graph(uniq_kmers::Vector{UInt64},
 
     # --- Pass 1: collect canonical (k-1)-mer set via sort+dedup. ---
     # Flat preallocated array + sort is ~3-5x faster than Set{UInt64} at
-    # this scale (46M entries) due to cache-friendly sequential access.
+    # this scale due to cache-friendly sequential access.
     n_kmers = length(uniq_kmers)
     km1mers = Vector{UInt64}(undef, 2 * n_kmers)
     @inbounds for i in 1:n_kmers
@@ -107,85 +107,71 @@ function build_graph(uniq_kmers::Vector{UInt64},
         km1mers[2i]   = _canonicalize_km1(suffix, km1)[1]
     end
     sort!(km1mers)
-    # Manual dedup into canonical_kmers — avoids the extra allocation of unique!
-    canonical_kmers = Vector{UInt64}(undef, 2 * n_kmers)
+    # Manual dedup in-place, then copy down to an exactly-sized array —
+    # resize! alone would keep the 2*n_kmers buffer reserved underneath.
     n_canonical = 0
     @inbounds for i in 1:(2 * n_kmers)
         if i == 1 || km1mers[i] != km1mers[i-1]
             n_canonical += 1
-            canonical_kmers[n_canonical] = km1mers[i]
+            km1mers[n_canonical] = km1mers[i]
         end
     end
-    resize!(canonical_kmers, n_canonical)
+    canonical_kmers = km1mers[1:n_canonical]
+    km1mers = UInt64[]   # release the 2*n_kmers oversized buffer before Pass 2
+    GC.gc()
 
-    # --- Pass 2: build edge list with twin tracking. ---
-    # Each k-mer i -> forward edge at 2i-1, reverse twin at 2i.
-    # Index-based layout (no sequential counter) makes this loop
-    # embarrassingly parallel — each iteration writes only to its own pair.
+    # --- Pass 2: CSR construction without materializing per-edge unsorted
+    # arrays or a permutation. Each k-mer i contributes exactly one forward
+    # edge and its twin reverse edge; since both are scattered within the
+    # same loop iteration, their final (sorted) positions are known to each
+    # other directly — no inv_perm/perm/twin_temp bookkeeping required.
+    # This trades the prior loop's thread-parallelism for ~5 fewer
+    # n_edges-sized arrays alive at once, which is the dominant memory cost
+    # at HPC scale (billions of k-mers).
     n_edges    = 2 * n_kmers
     n_oriented = 2 * n_canonical
-    edge_src  = Vector{Int64}(undef, n_edges)
-    edge_dst  = Vector{Int64}(undef, n_edges)
-    edge_w    = Vector{Int32}(undef, n_edges)
-    edge_lbl  = Vector{UInt8}(undef, n_edges)
-    twin_temp = Vector{Int64}(undef, n_edges)
 
-    Threads.@threads for i in 1:n_kmers
-        i_fwd = 2i - 1
-        i_rev = 2i
-        prefix, suffix, first_base, last_base = _split_kmer(uniq_kmers[i], k)
-
+    # Histogram pass: out-degree per oriented source node.
+    edge_offsets = zeros(Int64, n_oriented + 1)
+    @inbounds for i in 1:n_kmers
+        prefix, suffix, _, _ = _split_kmer(uniq_kmers[i], k)
         src_fwd = _oriented_id(prefix, km1, canonical_kmers)
         dst_fwd = _oriented_id(suffix, km1, canonical_kmers)
         src_rev = twin(dst_fwd)
-        dst_rev = twin(src_fwd)
-
-        edge_src[i_fwd] = src_fwd;  edge_dst[i_fwd] = dst_fwd
-        edge_w[i_fwd]   = counts[i]; edge_lbl[i_fwd] = last_base
-
-        edge_src[i_rev] = src_rev;  edge_dst[i_rev] = dst_rev
-        edge_w[i_rev]   = counts[i]; edge_lbl[i_rev] = _complement_base(first_base)
-
-        twin_temp[i_fwd] = Int64(i_rev)
-        twin_temp[i_rev] = Int64(i_fwd)
-    end
-
-    # Counting sort by source node — O(E + N) vs O(E log E) for sortperm.
-    # Pass 1: histogram → cumulative offsets (1-based CSR).
-    edge_offsets = zeros(Int64, n_oriented + 1)
-    @inbounds for e in 1:n_edges
-        edge_offsets[edge_src[e] + 1] += Int64(1)
+        edge_offsets[src_fwd + 1] += Int64(1)
+        edge_offsets[src_rev + 1] += Int64(1)
     end
     edge_offsets[1] = Int64(1)
     @inbounds for i in 2:(n_oriented + 1)
         edge_offsets[i] += edge_offsets[i - 1]
     end
 
-    # Pass 2: scatter edges into sorted output arrays.
-    # Record both directions of the permutation so twin pointers can be remapped:
-    #   inv_perm[old] = new  (old → sorted position)
-    #   perm[new]     = old  (sorted position → old)
+    # Scatter pass: write both directions of each k-mer's edge pair directly
+    # into their final sorted slots, linking twins inline.
     edge_dst_s   = Vector{Int64}(undef, n_edges)
     edge_w_s     = Vector{Int32}(undef, n_edges)
     edge_lbl_s   = Vector{UInt8}(undef, n_edges)
-    inv_perm     = Vector{Int64}(undef, n_edges)
-    perm         = Vector{Int64}(undef, n_edges)
-    pos          = copy(edge_offsets)   # writing cursor per node (mutated in-place)
-    @inbounds for old in 1:n_edges
-        s        = edge_src[old]
-        new      = pos[s]
-        pos[s]   = new + Int64(1)
-        edge_dst_s[new]  = edge_dst[old]
-        edge_w_s[new]    = edge_w[old]
-        edge_lbl_s[new]  = edge_lbl[old]
-        inv_perm[old]    = new
-        perm[new]        = Int64(old)
-    end
-
-    # Remap twin pointers from pre-sort indices to post-sort indices.
     edge_twins_s = Vector{Int64}(undef, n_edges)
-    @inbounds for new in 1:n_edges
-        edge_twins_s[new] = inv_perm[twin_temp[perm[new]]]
+    pos          = copy(edge_offsets)   # writing cursor per node (mutated in-place)
+    @inbounds for i in 1:n_kmers
+        prefix, suffix, first_base, last_base = _split_kmer(uniq_kmers[i], k)
+        src_fwd = _oriented_id(prefix, km1, canonical_kmers)
+        dst_fwd = _oriented_id(suffix, km1, canonical_kmers)
+        src_rev = twin(dst_fwd)
+        dst_rev = twin(src_fwd)
+
+        p_fwd = pos[src_fwd]; pos[src_fwd] = p_fwd + Int64(1)
+        p_rev = pos[src_rev]; pos[src_rev] = p_rev + Int64(1)
+
+        edge_dst_s[p_fwd]   = dst_fwd
+        edge_w_s[p_fwd]     = counts[i]
+        edge_lbl_s[p_fwd]   = last_base
+        edge_twins_s[p_fwd] = p_rev
+
+        edge_dst_s[p_rev]   = dst_rev
+        edge_w_s[p_rev]     = counts[i]
+        edge_lbl_s[p_rev]   = _complement_base(first_base)
+        edge_twins_s[p_rev] = p_fwd
     end
 
     edge_alive = trues(n_edges)
