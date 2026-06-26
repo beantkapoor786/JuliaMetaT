@@ -152,7 +152,13 @@ function build_graph(uniq_kmers::Vector{UInt64},
     edge_w_s     = Vector{Int32}(undef, n_edges)
     edge_lbl_s   = Vector{UInt8}(undef, n_edges)
     edge_twins_s = Vector{Int64}(undef, n_edges)
-    pos          = copy(edge_offsets)   # writing cursor per node (mutated in-place)
+    # Use edge_offsets itself as the mutable write-cursor (no separate `pos`
+    # copy — at HPC scale that's another n_oriented-sized Int64 array, the
+    # difference between fitting in RAM and OOMing). After the scatter,
+    # edge_offsets[v] no longer holds node v's start offset — it holds the
+    # position just past node v's last written edge, i.e. node (v+1)'s
+    # original start. We restore proper 1-based CSR starts below via an
+    # in-place backward shift, using that exact relationship.
     @inbounds for i in 1:n_kmers
         prefix, suffix, first_base, last_base = _split_kmer(uniq_kmers[i], k)
         src_fwd = _oriented_id(prefix, km1, canonical_kmers)
@@ -160,8 +166,8 @@ function build_graph(uniq_kmers::Vector{UInt64},
         src_rev = twin(dst_fwd)
         dst_rev = twin(src_fwd)
 
-        p_fwd = pos[src_fwd]; pos[src_fwd] = p_fwd + Int64(1)
-        p_rev = pos[src_rev]; pos[src_rev] = p_rev + Int64(1)
+        p_fwd = edge_offsets[src_fwd]; edge_offsets[src_fwd] = p_fwd + Int64(1)
+        p_rev = edge_offsets[src_rev]; edge_offsets[src_rev] = p_rev + Int64(1)
 
         edge_dst_s[p_fwd]   = dst_fwd
         edge_w_s[p_fwd]     = counts[i]
@@ -173,6 +179,15 @@ function build_graph(uniq_kmers::Vector{UInt64},
         edge_lbl_s[p_rev]   = _complement_base(first_base)
         edge_twins_s[p_rev] = p_fwd
     end
+
+    # Restore proper CSR start offsets: edge_offsets[v] currently holds
+    # original_start[v+1] (the cursor ran exactly outdeg[v] times past it).
+    # Shift right by one in place, highest index first to avoid clobbering
+    # values not yet read.
+    @inbounds for v in n_oriented:-1:1
+        edge_offsets[v + 1] = edge_offsets[v]
+    end
+    edge_offsets[1] = Int64(1)
 
     edge_alive = trues(n_edges)
 
