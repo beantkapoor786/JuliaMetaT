@@ -34,7 +34,7 @@ export build_graph, remove_tips!, compact_unitigs
 export n_nodes, out_edges, out_degree
 export n_canonical, n_unitigs
 export node_to_string, unitig_sequence
-export twin, forward_id, reverse_id, is_forward, canonical_idx
+export twin, forward_id, reverse_id, is_forward, canonical_idx, twin_edge
 
 # Round 3
 export Contig, find_components, traverse_contigs

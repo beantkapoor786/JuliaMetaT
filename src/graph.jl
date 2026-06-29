@@ -21,9 +21,12 @@ struct DeBruijnGraph
     edge_targets::Vector{Int64}        # destination oriented node ID
     edge_weights::Vector{Int32}        # k-mer count
     edge_labels::Vector{UInt8}         # base 0..3 emitted by traversing
-    edge_twins::Vector{Int64}          # index of this edge's twin edge
     edge_alive::BitVector
 end
+# No edge_twins field: at HPC scale this would be a 5th n_edges-sized Int64
+# array (~155 GB at 19B edges) — the array that actually tipped build_graph
+# into OOM. Every node has out-degree <= 4 (one per base), so a twin edge is
+# found by a tiny on-the-fly scan instead — see twin_edge() / _twin_edge_with_src().
 
 # Node/edge IDs use Int64: at HPC scale (billions of unique k-mers), the
 # number of canonical (k-1)-mers and the number of edges both exceed the
@@ -47,6 +50,96 @@ function out_degree(g::DeBruijnGraph, v::Integer)
         g.edge_alive[e] && (cnt += 1)
     end
     cnt
+end
+
+# --- Twin edge lookup (no stored edge_twins array — see DeBruijnGraph) ---
+#
+# Edge e: src(e) -> edge_targets[e]. Its twin is the edge
+# twin(edge_targets[e]) -> twin(src(e)), found by scanning the (<=4-entry)
+# out-edge bucket of twin(edge_targets[e]) for the matching target.
+#
+# Parallel edges (same (src,dst) pair from two different k-mers — possible
+# with repeats, even in small test data) mean "first matching target" is not
+# enough to identify the right twin: every k-mer that produces a given
+# (src,dst) edge is written, within the same build_graph loop iteration, to
+# BOTH its own bucket and its twin's bucket at the same relative position
+# (see build_graph). So matching by *rank* among same-target entries (not
+# just first match) pairs parallel edges with their true twins.
+#
+# Self-dual edge class (twin(d)==s, i.e. the edge is its own reverse-
+# complement class — e.g. a palindromic k-mer like ACGT): then ts==s and the
+# search bucket is the edge's own bucket. A k-mer in this class still writes
+# two distinct entries (its own fwd and rev), back to back in rank order
+# within that bucket — so rank r pairs with r+1 (if odd) / r-1 (if even)
+# instead of matching itself.
+@inline function _nth_match(edge_offsets, edge_targets, node, target, rank)
+    cnt = Int64(0)
+    @inbounds for ee in edge_offsets[node]:(edge_offsets[node + Int64(1)] - Int64(1))
+        if edge_targets[ee] == target
+            cnt += Int64(1)
+            cnt == rank && return ee
+        end
+    end
+    return Int64(0)
+end
+
+@inline function _twin_edge_with_src(e::Integer, edge_offsets, edge_targets, edge_src)
+    s  = edge_src[e]
+    d  = edge_targets[e]
+    ts = twin(d)
+    td = twin(s)
+
+    rank = Int64(0)
+    @inbounds for ee in edge_offsets[s]:(edge_offsets[s + Int64(1)] - Int64(1))
+        if edge_targets[ee] == d
+            rank += Int64(1)
+            ee == e && break
+        end
+    end
+
+    if ts == s
+        return isodd(rank) ? _nth_match(edge_offsets, edge_targets, s, d, rank + Int64(1)) :
+                              _nth_match(edge_offsets, edge_targets, s, d, rank - Int64(1))
+    end
+    return _nth_match(edge_offsets, edge_targets, ts, td, rank)
+end
+
+"""
+    twin_edge(g::DeBruijnGraph, e::Integer) -> Int64
+
+Find edge e's twin. Convenience form for occasional/test use — locates
+src(e) via binary search over `edge_offsets` (O(log n_nodes)). Hot loops
+that already have an `edge_src` array on hand should call
+`_twin_edge_with_src` directly to skip this search.
+"""
+function twin_edge(g::DeBruijnGraph, e::Integer)
+    lo, hi = 1, n_nodes(g)
+    while lo < hi
+        mid = (lo + hi) >> 1
+        if g.edge_offsets[mid + 1] <= e
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+    s = lo
+    # Same rank-matching logic as _twin_edge_with_src, just with a known
+    # scalar `s` instead of an edge_src array lookup.
+    d  = g.edge_targets[e]
+    ts = twin(d)
+    td = twin(s)
+    rank = Int64(0)
+    @inbounds for ee in g.edge_offsets[s]:(g.edge_offsets[s + Int64(1)] - Int64(1))
+        if g.edge_targets[ee] == d
+            rank += Int64(1)
+            ee == e && break
+        end
+    end
+    if ts == s
+        return isodd(rank) ? _nth_match(g.edge_offsets, g.edge_targets, s, d, rank + Int64(1)) :
+                              _nth_match(g.edge_offsets, g.edge_targets, s, d, rank - Int64(1))
+    end
+    return _nth_match(g.edge_offsets, g.edge_targets, ts, td, rank)
 end
 
 # --- (k-1)-mer helpers ---
@@ -147,11 +240,13 @@ function build_graph(uniq_kmers::Vector{UInt64},
     end
 
     # Scatter pass: write both directions of each k-mer's edge pair directly
-    # into their final sorted slots, linking twins inline.
+    # into their final sorted slots. No edge_twins array — twin lookups are
+    # computed on demand (see twin_edge / _twin_edge_with_src above); at this
+    # scale a 5th n_edges-sized Int64 array (~155 GB) is what tips build_graph
+    # into OOM, and every node has out-degree <= 4 so the lookup is cheap.
     edge_dst_s   = Vector{Int64}(undef, n_edges)
     edge_w_s     = Vector{Int32}(undef, n_edges)
     edge_lbl_s   = Vector{UInt8}(undef, n_edges)
-    edge_twins_s = Vector{Int64}(undef, n_edges)
     # Use edge_offsets itself as the mutable write-cursor (no separate `pos`
     # copy — at HPC scale that's another n_oriented-sized Int64 array, the
     # difference between fitting in RAM and OOMing). After the scatter,
@@ -172,12 +267,10 @@ function build_graph(uniq_kmers::Vector{UInt64},
         edge_dst_s[p_fwd]   = dst_fwd
         edge_w_s[p_fwd]     = counts[i]
         edge_lbl_s[p_fwd]   = last_base
-        edge_twins_s[p_fwd] = p_rev
 
         edge_dst_s[p_rev]   = dst_rev
         edge_w_s[p_rev]     = counts[i]
         edge_lbl_s[p_rev]   = _complement_base(first_base)
-        edge_twins_s[p_rev] = p_fwd
     end
 
     # Restore proper CSR start offsets: edge_offsets[v] currently holds
@@ -192,8 +285,7 @@ function build_graph(uniq_kmers::Vector{UInt64},
     edge_alive = trues(n_edges)
 
     return DeBruijnGraph(k, canonical_kmers, edge_offsets,
-                         edge_dst_s, edge_w_s, edge_lbl_s,
-                         edge_twins_s, edge_alive)
+                         edge_dst_s, edge_w_s, edge_lbl_s, edge_alive)
 end
 
 # --- Edge simplification ---
@@ -221,10 +313,11 @@ function remove_tips!(g::DeBruijnGraph;
     n   = n_nodes(g)
     n_e = length(g.edge_targets)
 
-    # Upload static arrays once — weights, twins, offsets never change after
-    # build_graph. Only edge_alive round-trips each pass.
+    # Upload static arrays once — weights, targets, offsets never change after
+    # build_graph. Only edge_alive round-trips each pass. No edge_twins
+    # upload — twin lookups are computed on the fly from targets_d/offsets_d.
     weights_d = JACC.to_device(g.edge_weights)
-    twins_d   = JACC.to_device(g.edge_twins)
+    targets_d = JACC.to_device(g.edge_targets)
     offsets_d = JACC.to_device(g.edge_offsets)
     # Scratch buffers for relative prune (reused across convergence iterations).
     src_d     = JACC.to_device(zeros(Int64, n_e))
@@ -243,7 +336,7 @@ function remove_tips!(g::DeBruijnGraph;
     iters = 0
     while true
         tr = @elapsed r = _relative_prune!(g, relative_threshold,
-                                           offsets_d, weights_d, twins_d,
+                                           offsets_d, weights_d, targets_d,
                                            src_d, max_d, alive_d)
         t_rel += tr
         iters += 1
@@ -278,7 +371,9 @@ end
 # JACC kernel: one thread per edge. Kills edges (and twins) whose weight
 # falls below relative_threshold × the local max out-weight at their
 # source node. Same idempotent twin-write safety as _floor_prune_kernel!.
-function _relative_prune_kernel!(e, edge_weights, edge_twins, edge_src,
+# No edge_twins array: the twin edge is found on the fly via
+# _twin_edge_with_src (out-degree <= 4, so this is a tiny bounded scan).
+function _relative_prune_kernel!(e, edge_weights, edge_offsets, edge_targets, edge_src,
                                   max_out_w, relative_threshold::Float32, edge_alive)
     @inbounds begin
         edge_alive[e] == UInt8(0) && return nothing
@@ -287,7 +382,8 @@ function _relative_prune_kernel!(e, edge_weights, edge_twins, edge_src,
         # Float32 throughout — Metal shaders reject Float64 entirely.
         if Float32(edge_weights[e]) < relative_threshold * Float32(local_max)
             edge_alive[e] = UInt8(0)
-            edge_alive[edge_twins[e]] = UInt8(0)
+            te = _twin_edge_with_src(e, edge_offsets, edge_targets, edge_src)
+            edge_alive[te] = UInt8(0)
         end
     end
     return nothing
@@ -300,14 +396,14 @@ end
 # function reads/writes it in-place without re-uploading from host.
 # Writes results back into g.edge_alive; returns count of newly-dead edges.
 function _relative_prune!(g::DeBruijnGraph, relative_threshold::Float64,
-                          offsets_d, weights_d, twins_d, src_d, max_d, alive_d)
+                          offsets_d, weights_d, targets_d, src_d, max_d, alive_d)
     n   = n_nodes(g)
     n_e = length(g.edge_targets)
 
     JACC.parallel_for(n, _node_pass_kernel!, offsets_d, weights_d, alive_d, src_d, max_d)
     # Pass Float32 explicitly — Metal shaders reject Float64 kernel args.
     JACC.parallel_for(n_e, _relative_prune_kernel!,
-        weights_d, twins_d, src_d, max_d, Float32(relative_threshold), alive_d)
+        weights_d, offsets_d, targets_d, src_d, max_d, Float32(relative_threshold), alive_d)
 
     alive_host = JACC.to_host(alive_d)
     killed = 0
@@ -320,6 +416,21 @@ function _relative_prune!(g::DeBruijnGraph, relative_threshold::Float64,
     return killed
 end
 
+# Per-node out-edge-range scan, host/threaded version of _node_pass_kernel!'s
+# edge_src side-output. Transient (n_e-sized Int64, freed once its caller
+# returns) — used where a single CPU-side pass needs source-node lookups
+# without paying for a permanently-stored edge_src/edge_twins array.
+function _compute_edge_src_host(g::DeBruijnGraph)
+    n_e = length(g.edge_targets)
+    edge_src = Vector{Int64}(undef, n_e)
+    Threads.@threads for v in 1:n_nodes(g)
+        @inbounds for e in out_edges(g, v)
+            edge_src[e] = v
+        end
+    end
+    return edge_src
+end
+
 # Floor prune runs entirely on CPU threads — no Metal dispatch overhead,
 # no device transfers, no BitVector word-level races.
 # Strategy: mark kills into a Vector{UInt8} scratch buffer (one byte per
@@ -327,8 +438,8 @@ end
 function _floor_prune!(g::DeBruijnGraph, min_edge_weight::Int)
     n_e = length(g.edge_targets)
     w   = g.edge_weights
-    tw  = g.edge_twins
     mw  = Int32(min_edge_weight)
+    edge_src = _compute_edge_src_host(g)
 
     # Scratch buffer: 1 = alive, 0 = dead. Start fully alive.
     scratch = ones(UInt8, n_e)
@@ -338,8 +449,9 @@ function _floor_prune!(g::DeBruijnGraph, min_edge_weight::Int)
     # so concurrent writes are idempotent — no race can corrupt state.
     Threads.@threads for e in 1:n_e
         @inbounds if w[e] < mw
-            scratch[e]      = UInt8(0)
-            scratch[tw[e]]  = UInt8(0)
+            scratch[e] = UInt8(0)
+            te = _twin_edge_with_src(e, g.edge_offsets, g.edge_targets, edge_src)
+            scratch[te] = UInt8(0)
         end
     end
 
@@ -538,7 +650,7 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
         unitig_twins = zeros(Int32, n_walks)
         @inbounds for u in 1:n_walks
             for e in walk_edges[u]
-                t = g.edge_twins[e]
+                t = _twin_edge_with_src(e, g.edge_offsets, g.edge_targets, edge_src)
                 if edge_to_unitig[t] != 0
                     unitig_twins[u] = edge_to_unitig[t]
                     break
