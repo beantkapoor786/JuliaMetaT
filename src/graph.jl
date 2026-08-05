@@ -505,49 +505,28 @@ n_unitigs(g::CompactedGraph) = length(g.edge_targets)
 Collapse maximal non-branching paths in the doubled-directed graph.
 Each unitig has a twin unitig representing the reverse-complement path.
 """
-# JACC kernel: one thread per oriented node v. Scans v's own out-edge
-# range (disjoint across nodes — no races) to count live out-degree.
-# No edge_src output: callers that need the source node use
-# _twin_edge_known_src(e, v, ...) or twin_edge(g, e) directly.
-function _node_degree_pass_kernel!(v, edge_offsets, edge_alive, outdeg)
-    lo = edge_offsets[v]
-    hi = edge_offsets[v + Int64(1)] - Int64(1)
-    cnt = Int32(0)
-    @inbounds for e in lo:hi
-        edge_alive[e] != UInt8(0) && (cnt += Int32(1))
-    end
-    outdeg[v] = cnt
-    return nothing
-end
-
-# JACC kernel: in-degree via the twin invariant — every live edge ending
-# at v has a twin edge starting at twin(v) (twin-paired pruning keeps
-# aliveness in sync), so indeg(v) == outdeg(twin(v)). This turns the
-# in-degree scatter (which would race across source nodes) into a
-# race-free elementwise gather.
-function _indeg_from_twin_kernel!(v, outdeg, indeg)
-    @inbounds indeg[v] = outdeg[twin(v)]
-    return nothing
-end
-
-# Compute (indeg, outdeg) for the doubled-directed graph via JACC
-# parallel_for dispatches. No edge_src returned — callers that need the
-# source node of an edge use twin_edge(g, e) (binary search, O(log n_nodes))
-# or _twin_edge_known_src when the node is already in scope. Eliminating
-# edge_src saves one n_e-sized Int64 array (~155 GB at HPC scale).
+# Compute (indeg, outdeg) for the doubled-directed graph on CPU threads.
+# No device transfers: at HPC scale (12B+ nodes) the device allocations
+# (offsets_d ~99 GB, outdeg_d/indeg_d ~50 GB each) would spill to host RAM
+# and push the peak above the job's memory limit. The degree computation is
+# a simple CSR scan — CPU threads saturate bandwidth equally well here.
+# Twin invariant: indeg(v) == outdeg(twin(v)) — every live edge e: u→v has
+# a twin edge twin(v)→twin(u), so in-edges to v are out-edges from twin(v).
 function _compute_degrees(g::DeBruijnGraph)
-    n   = n_nodes(g)
-    edge_alive_u8 = UInt8.(g.edge_alive)
-
-    offsets_d = JACC.to_device(g.edge_offsets)
-    alive_d   = JACC.to_device(edge_alive_u8)
-    outdeg_d  = JACC.to_device(zeros(Int32, n))
-    JACC.parallel_for(n, _node_degree_pass_kernel!, offsets_d, alive_d, outdeg_d)
-
-    indeg_d = JACC.to_device(zeros(Int32, n))
-    JACC.parallel_for(n, _indeg_from_twin_kernel!, outdeg_d, indeg_d)
-
-    return JACC.to_host(indeg_d), JACC.to_host(outdeg_d)
+    n = n_nodes(g)
+    outdeg = zeros(Int32, n)
+    Threads.@threads for v in 1:n
+        cnt = Int32(0)
+        @inbounds for e in g.edge_offsets[v]:(g.edge_offsets[v + 1] - 1)
+            g.edge_alive[e] && (cnt += Int32(1))
+        end
+        outdeg[v] = cnt
+    end
+    indeg = Vector{Int32}(undef, n)
+    @inbounds for v in 1:n
+        indeg[v] = outdeg[twin(v)]
+    end
+    return indeg, outdeg
 end
 
 function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothing)
