@@ -104,6 +104,28 @@ end
     return _nth_match(edge_offsets, edge_targets, ts, td, rank)
 end
 
+# Variant of _twin_edge_with_src for node-parallel loops where the caller
+# already knows the source node s directly (no edge_src array needed).
+@inline function _twin_edge_known_src(e::Integer, s::Integer, edge_offsets, edge_targets)
+    d  = edge_targets[e]
+    ts = twin(d)
+    td = twin(s)
+
+    rank = Int64(0)
+    @inbounds for ee in edge_offsets[s]:(edge_offsets[s + Int64(1)] - Int64(1))
+        if edge_targets[ee] == d
+            rank += Int64(1)
+            ee == e && break
+        end
+    end
+
+    if ts == s
+        return isodd(rank) ? _nth_match(edge_offsets, edge_targets, s, d, rank + Int64(1)) :
+                              _nth_match(edge_offsets, edge_targets, s, d, rank - Int64(1))
+    end
+    return _nth_match(edge_offsets, edge_targets, ts, td, rank)
+end
+
 """
     twin_edge(g::DeBruijnGraph, e::Integer) -> Int64
 
@@ -316,11 +338,11 @@ function remove_tips!(g::DeBruijnGraph;
     # Upload static arrays once — weights, targets, offsets never change after
     # build_graph. Only edge_alive round-trips each pass. No edge_twins
     # upload — twin lookups are computed on the fly from targets_d/offsets_d.
+    # No src_d: pruning kernels are now node-parallel, so each thread knows
+    # its source node directly — no n_e-sized edge_src scratch buffer.
     weights_d = JACC.to_device(g.edge_weights)
     targets_d = JACC.to_device(g.edge_targets)
     offsets_d = JACC.to_device(g.edge_offsets)
-    # Scratch buffers for relative prune (reused across convergence iterations).
-    src_d     = JACC.to_device(zeros(Int64, n_e))
     max_d     = JACC.to_device(zeros(Int32, n))
 
     # Floor prune is idempotent: edge weights never change, so one pass is enough.
@@ -337,7 +359,7 @@ function remove_tips!(g::DeBruijnGraph;
     while true
         tr = @elapsed r = _relative_prune!(g, relative_threshold,
                                            offsets_d, weights_d, targets_d,
-                                           src_d, max_d, alive_d)
+                                           max_d, alive_d)
         t_rel += tr
         iters += 1
         total_removed += r
@@ -351,14 +373,14 @@ function remove_tips!(g::DeBruijnGraph;
 end
 
 # JACC kernel: one thread per oriented node v. Scans v's own out-edge
-# range (disjoint across nodes — no races) to record each edge's source
-# and the strongest live out-edge weight at v.
-function _node_pass_kernel!(v, edge_offsets, edge_weights, edge_alive, edge_src, max_out_w)
+# range (disjoint across nodes — no races) to find the strongest live
+# out-edge weight at v. No edge_src output — callers that need the source
+# use _twin_edge_known_src with v directly (see _relative_prune_node_kernel!).
+function _node_max_kernel!(v, edge_offsets, edge_weights, edge_alive, max_out_w)
     lo = edge_offsets[v]
     hi = edge_offsets[v + Int64(1)] - Int64(1)
     m = Int32(0)
     @inbounds for e in lo:hi
-        edge_src[e] = v
         if edge_alive[e] != UInt8(0)
             w = edge_weights[e]
             w > m && (m = w)
@@ -368,42 +390,47 @@ function _node_pass_kernel!(v, edge_offsets, edge_weights, edge_alive, edge_src,
     return nothing
 end
 
-# JACC kernel: one thread per edge. Kills edges (and twins) whose weight
-# falls below relative_threshold × the local max out-weight at their
-# source node. Same idempotent twin-write safety as _floor_prune_kernel!.
-# No edge_twins array: the twin edge is found on the fly via
-# _twin_edge_with_src (out-degree <= 4, so this is a tiny bounded scan).
-function _relative_prune_kernel!(e, edge_weights, edge_offsets, edge_targets, edge_src,
-                                  max_out_w, relative_threshold::Float32, edge_alive)
+# JACC kernel: one thread per oriented node v. Kills edges (and their twins)
+# whose weight falls below relative_threshold × the local max out-weight.
+# Node-parallel: each thread owns its own CSR range, so it knows s = v
+# directly and calls _twin_edge_known_src — no n_e-sized edge_src array.
+# Twin writes are idempotent (both write UInt8(0)), so concurrent writes
+# from different node threads are safe.
+function _relative_prune_node_kernel!(v, edge_weights, edge_offsets, edge_targets,
+                                      max_out_w, relative_threshold::Float32, edge_alive)
     @inbounds begin
-        edge_alive[e] == UInt8(0) && return nothing
-        local_max = max_out_w[edge_src[e]]
+        local_max = max_out_w[v]
         local_max == Int32(0) && return nothing
-        # Float32 throughout — Metal shaders reject Float64 entirely.
-        if Float32(edge_weights[e]) < relative_threshold * Float32(local_max)
-            edge_alive[e] = UInt8(0)
-            te = _twin_edge_with_src(e, edge_offsets, edge_targets, edge_src)
-            edge_alive[te] = UInt8(0)
+        lo = edge_offsets[v]
+        hi = edge_offsets[v + Int64(1)] - Int64(1)
+        for e in lo:hi
+            edge_alive[e] == UInt8(0) && continue
+            # Float32 throughout — Metal shaders reject Float64 entirely.
+            if Float32(edge_weights[e]) < relative_threshold * Float32(local_max)
+                edge_alive[e] = UInt8(0)
+                te = _twin_edge_known_src(e, v, edge_offsets, edge_targets)
+                edge_alive[te] = UInt8(0)
+            end
         end
     end
     return nothing
 end
 
 # Run the local relative-threshold pruning pass entirely on-device:
-# (1) per-node pass computes edge_src + local max out-weight,
-# (2) per-edge pass kills edges below relative_threshold × local max.
-# alive_d is owned by remove_tips! and persists across iterations — this
-# function reads/writes it in-place without re-uploading from host.
+# (1) per-node pass computes local max out-weight,
+# (2) per-node pass kills edges below relative_threshold × local max.
+# Both passes are node-parallel — no n_e-sized edge_src scratch buffer.
+# alive_d is owned by remove_tips! and persists across iterations.
 # Writes results back into g.edge_alive; returns count of newly-dead edges.
 function _relative_prune!(g::DeBruijnGraph, relative_threshold::Float64,
-                          offsets_d, weights_d, targets_d, src_d, max_d, alive_d)
+                          offsets_d, weights_d, targets_d, max_d, alive_d)
     n   = n_nodes(g)
     n_e = length(g.edge_targets)
 
-    JACC.parallel_for(n, _node_pass_kernel!, offsets_d, weights_d, alive_d, src_d, max_d)
+    JACC.parallel_for(n, _node_max_kernel!, offsets_d, weights_d, alive_d, max_d)
     # Pass Float32 explicitly — Metal shaders reject Float64 kernel args.
-    JACC.parallel_for(n_e, _relative_prune_kernel!,
-        weights_d, offsets_d, targets_d, src_d, max_d, Float32(relative_threshold), alive_d)
+    JACC.parallel_for(n, _relative_prune_node_kernel!,
+        weights_d, offsets_d, targets_d, max_d, Float32(relative_threshold), alive_d)
 
     alive_host = JACC.to_host(alive_d)
     killed = 0
@@ -416,42 +443,28 @@ function _relative_prune!(g::DeBruijnGraph, relative_threshold::Float64,
     return killed
 end
 
-# Per-node out-edge-range scan, host/threaded version of _node_pass_kernel!'s
-# edge_src side-output. Transient (n_e-sized Int64, freed once its caller
-# returns) — used where a single CPU-side pass needs source-node lookups
-# without paying for a permanently-stored edge_src/edge_twins array.
-function _compute_edge_src_host(g::DeBruijnGraph)
-    n_e = length(g.edge_targets)
-    edge_src = Vector{Int64}(undef, n_e)
-    Threads.@threads for v in 1:n_nodes(g)
-        @inbounds for e in out_edges(g, v)
-            edge_src[e] = v
-        end
-    end
-    return edge_src
-end
 
 # Floor prune runs entirely on CPU threads — no Metal dispatch overhead,
 # no device transfers, no BitVector word-level races.
-# Strategy: mark kills into a Vector{UInt8} scratch buffer (one byte per
-# edge, thread-safe for idempotent zeroing), then fold back into edge_alive.
+# Node-parallel: each thread owns a disjoint node (and thus a disjoint CSR
+# range), so it knows s = v directly — no n_e-sized edge_src array needed.
+# Twin writes share no state with the owning-node write (the twin lives in a
+# different node's range), but both write UInt8(0) — idempotent, no race.
 function _floor_prune!(g::DeBruijnGraph, min_edge_weight::Int)
     n_e = length(g.edge_targets)
     w   = g.edge_weights
     mw  = Int32(min_edge_weight)
-    edge_src = _compute_edge_src_host(g)
 
     # Scratch buffer: 1 = alive, 0 = dead. Start fully alive.
     scratch = ones(UInt8, n_e)
 
-    # Each thread owns a disjoint set of edges (by index). The only shared
-    # writes are to twin slots, but twin pairs write the same value (0),
-    # so concurrent writes are idempotent — no race can corrupt state.
-    Threads.@threads for e in 1:n_e
-        @inbounds if w[e] < mw
-            scratch[e] = UInt8(0)
-            te = _twin_edge_with_src(e, g.edge_offsets, g.edge_targets, edge_src)
-            scratch[te] = UInt8(0)
+    Threads.@threads for v in 1:n_nodes(g)
+        @inbounds for e in g.edge_offsets[v]:(g.edge_offsets[v + 1] - 1)
+            if w[e] < mw
+                scratch[e] = UInt8(0)
+                te = _twin_edge_known_src(e, v, g.edge_offsets, g.edge_targets)
+                scratch[te] = UInt8(0)
+            end
         end
     end
 
@@ -493,14 +506,14 @@ Collapse maximal non-branching paths in the doubled-directed graph.
 Each unitig has a twin unitig representing the reverse-complement path.
 """
 # JACC kernel: one thread per oriented node v. Scans v's own out-edge
-# range (disjoint across nodes — no races) to label edge sources and
-# count live out-degree.
-function _node_degree_pass_kernel!(v, edge_offsets, edge_alive, edge_src, outdeg)
+# range (disjoint across nodes — no races) to count live out-degree.
+# No edge_src output: callers that need the source node use
+# _twin_edge_known_src(e, v, ...) or twin_edge(g, e) directly.
+function _node_degree_pass_kernel!(v, edge_offsets, edge_alive, outdeg)
     lo = edge_offsets[v]
     hi = edge_offsets[v + Int64(1)] - Int64(1)
     cnt = Int32(0)
     @inbounds for e in lo:hi
-        edge_src[e] = v
         edge_alive[e] != UInt8(0) && (cnt += Int32(1))
     end
     outdeg[v] = cnt
@@ -517,30 +530,30 @@ function _indeg_from_twin_kernel!(v, outdeg, indeg)
     return nothing
 end
 
-# Compute (indeg, outdeg, edge_src) for the doubled-directed graph as
-# JACC parallel_for dispatches — see kernels above for the race-free
-# decomposition (per-node out-edge ranges + twin-invariant gather).
-function _compute_degrees_and_edge_src(g::DeBruijnGraph)
+# Compute (indeg, outdeg) for the doubled-directed graph via JACC
+# parallel_for dispatches. No edge_src returned — callers that need the
+# source node of an edge use twin_edge(g, e) (binary search, O(log n_nodes))
+# or _twin_edge_known_src when the node is already in scope. Eliminating
+# edge_src saves one n_e-sized Int64 array (~155 GB at HPC scale).
+function _compute_degrees(g::DeBruijnGraph)
     n   = n_nodes(g)
-    n_e = length(g.edge_targets)
     edge_alive_u8 = UInt8.(g.edge_alive)
 
     offsets_d = JACC.to_device(g.edge_offsets)
     alive_d   = JACC.to_device(edge_alive_u8)
-    src_d     = JACC.to_device(zeros(Int64, n_e))
     outdeg_d  = JACC.to_device(zeros(Int32, n))
-    JACC.parallel_for(n, _node_degree_pass_kernel!, offsets_d, alive_d, src_d, outdeg_d)
+    JACC.parallel_for(n, _node_degree_pass_kernel!, offsets_d, alive_d, outdeg_d)
 
     indeg_d = JACC.to_device(zeros(Int32, n))
     JACC.parallel_for(n, _indeg_from_twin_kernel!, outdeg_d, indeg_d)
 
-    return JACC.to_host(indeg_d), JACC.to_host(outdeg_d), JACC.to_host(src_d)
+    return JACC.to_host(indeg_d), JACC.to_host(outdeg_d)
 end
 
 function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothing)
     n_e = length(g.edge_targets)
 
-    t_deg = @elapsed indeg, outdeg, edge_src = _compute_degrees_and_edge_src(g)
+    t_deg = @elapsed indeg, outdeg = _compute_degrees(g)
 
     # Phase 1: O(E) scan for non-cycle chain starts.
     # A chain start is any alive edge whose source node is non-linear
@@ -551,11 +564,12 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
     t_starts = @elapsed begin
         starts = Int64[]
         sizehint!(starts, n_e ÷ 4)
-        for e in 1:n_e
-            g.edge_alive[e] || continue
-            src = edge_src[e]
-            (indeg[src] != 1 || outdeg[src] != 1) || continue
-            push!(starts, Int64(e))
+        for v in 1:n_nodes(g)
+            (indeg[v] != 1 || outdeg[v] != 1) || continue
+            for e in out_edges(g, v)
+                g.edge_alive[e] || continue
+                push!(starts, Int64(e))
+            end
         end
     end
     n_nc = length(starts)
@@ -590,7 +604,7 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
             weight_count += Int32(1)
             cur_dst = g.edge_targets[next_e]
         end
-        walk_src[i]    = edge_src[e_start]
+        walk_src[i]    = twin(g.edge_targets[twin_edge(g, e_start)])
         walk_dst[i]    = cur_dst
         walk_weight[i] = Float32(weight_sum) / Float32(weight_count)
         walk_seqs[i]   = bases
@@ -631,7 +645,7 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
                 cur_dst = g.edge_targets[next_e]
             end
             push!(starts, Int64(e))
-            push!(walk_src, edge_src[e])
+            push!(walk_src, twin(g.edge_targets[twin_edge(g, e)]))
             push!(walk_dst, cur_dst)
             push!(walk_weight, Float32(cy_weight_sum) / Float32(cy_weight_cnt))
             push!(walk_seqs, cy_bases)
@@ -650,7 +664,7 @@ function compact_unitigs(g::DeBruijnGraph; verbose::Bool = false, log_io = nothi
         unitig_twins = zeros(Int32, n_walks)
         @inbounds for u in 1:n_walks
             for e in walk_edges[u]
-                t = _twin_edge_with_src(e, g.edge_offsets, g.edge_targets, edge_src)
+                t = twin_edge(g, e)
                 if edge_to_unitig[t] != 0
                     unitig_twins[u] = edge_to_unitig[t]
                     break
